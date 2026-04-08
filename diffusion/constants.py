@@ -20,6 +20,8 @@ class ENV(IntEnum):
   Kitchen = 2
   Mujoco = 3
   Antmaze = 4
+  ETF = 5
+  PORTFOLIO = 6
 
 
 ENV_MAP = {
@@ -35,22 +37,38 @@ ENV_MAP = {
   'humanoid': ENV.Mujoco,
   'cartpole': ENV.Mujoco,
   'fish': ENV.Mujoco,
-  'antmaze': ENV.Antmaze
+  'antmaze': ENV.Antmaze,
+  'etf': ENV.ETF,
+  'portfolio': ENV.PORTFOLIO,
 }
 
 ENVNAME_MAP = {
   ENV.Adroit: 'Adroit',
   ENV.Kitchen: 'Kitchen',
   ENV.Mujoco: 'Mujoco',
-  ENV.Antmaze: 'Antmaze'
+  ENV.Antmaze: 'Antmaze',
+  ENV.ETF: 'ETF',
+  ENV.PORTFOLIO: 'PORTFOLIO',
 }
 
 
 class DATASET(IntEnum):
   D4RL = 1
   RLUP = 2
+  ETF = 3
+  PORTFOLIO = 4
 
 
-DATASET_MAP = {'d4rl': DATASET.D4RL, 'rl_unplugged': DATASET.RLUP}
+DATASET_MAP = {
+    'd4rl': DATASET.D4RL,
+    'rl_unplugged': DATASET.RLUP,
+    'etf': DATASET.ETF,
+    'portfolio': DATASET.PORTFOLIO,
+}
 
-DATASET_ABBR_MAP = {'d4rl': 'D4RL', 'rl_unplugged': 'RLUP'}
+DATASET_ABBR_MAP = {
+    'd4rl': 'D4RL',
+    'rl_unplugged': 'RLUP',
+    'etf': 'ETF',
+    'portfolio': 'PORTFOLIO',
+}

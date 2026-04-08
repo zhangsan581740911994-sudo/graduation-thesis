@@ -121,21 +121,98 @@ class ReplayBuffer(object):
 
 
 def get_d4rl_dataset(env, nstep=1, gamma=0.9, norm_reward=False):
-  # if nstep == 1:
-  #   dataset = d4rl.qlearning_dataset(env)
-  # else:
-  # Always sort the dataset according to trajectory return
+  """High-level helper: 从 D4RL env 构造一个训练用的 dict。
+
+  你需要知道的点：
+  - 这是 Trainer 调数据的唯一入口之一：_setup_d4rl() 里会调用这个函数。
+  - 它内部会：
+    1）调用 get_nstep_dataset 做 n-step 回报与按轨迹排序；
+    2）返回一个键固定的 dict（obs / actions / next_obs / rewards / dones...），
+       方便后面直接塞进 data.Dataset 再 sample。
+
+  不需要纠结的点（可以先略过）：
+  - sorting=True：get_nstep_dataset 里会按轨迹 return 排序，更多是数据组织细节；
+  - dones_float：主要用于按 trajectory 切分、做 n-step 时的边界处理，训练 loss 本身并不会直接用到它。
+  """
+  # 之前可能支持 nstep==1 直接用 d4rl.qlearning_dataset，这里统一走 n-step 路径，
+  # 并且 sorting=True：始终按轨迹 return 排好序再展开成 transition 级别的数据。
   dataset = get_nstep_dataset(
     env, nstep, gamma, sorting=True, norm_reward=norm_reward
   )
 
+  # 将 get_nstep_dataset 返回的内部字段，整理成后续代码统一使用的键名。
+  # 这些键就是后面 batch 里会出现的字段名。
   return dict(
     observations=dataset["observations"],
     actions=dataset["actions"],
     next_observations=dataset["next_observations"],
     rewards=dataset["rewards"],
+    # terminals -> dones：转成 float32，供 TD 目标里 (1-done)*gamma 使用。
     dones=dataset["terminals"].astype(np.float32),
+    # dones_float 只保留更细粒度的「episode 结束」信息，供 n-step / 轨迹逻辑使用。
     dones_float=dataset["dones_float"],
+  )
+
+
+def get_etf_dataset(
+    csv_path,
+    nstep,
+    gamma,
+    norm_reward=False,
+    behavior_seed=0,
+    policy=None,
+):
+  """与 get_d4rl_dataset 相同输出键，数据来自 ETF CSV + 行为策略 rollout。"""
+  from utilities.etf_dataset import build_etf_nstep_dataset
+
+  dataset = build_etf_nstep_dataset(
+      csv_path,
+      nstep=nstep,
+      gamma=gamma,
+      sorting=True,
+      norm_reward=norm_reward,
+      behavior_seed=behavior_seed,
+      policy=policy,
+  )
+  return dict(
+      observations=dataset["observations"],
+      actions=dataset["actions"],
+      next_observations=dataset["next_observations"],
+      rewards=dataset["rewards"],
+      dones=dataset["terminals"].astype(np.float32),
+      dones_float=dataset["dones_float"],
+  )
+
+
+def get_portfolio_dataset(
+    csv_path,
+    nstep,
+    gamma,
+    norm_reward=False,
+    behavior_seed=0,
+    policy=None,
+):
+  """与 get_d4rl_dataset 相同输出键，数据来自面板收益率 CSV + 行为策略 rollout。"""
+  from trading_env.panel_loader import load_returns_panel_csv
+  from utilities.portfolio_dataset import build_portfolio_nstep_dataset
+
+  returns, _ = load_returns_panel_csv(csv_path)
+  dataset = build_portfolio_nstep_dataset(
+      returns,
+      nstep=nstep,
+      gamma=gamma,
+      sorting=True,
+      norm_reward=norm_reward,
+      behavior_seed=behavior_seed,
+      policy=policy,
+  )
+  return dict(
+      observations=dataset["observations"],
+      actions=dataset["actions"],
+      next_observations=dataset["next_observations"],
+      rewards=dataset["rewards"],
+      dones=dataset["terminals"].astype(np.float32),
+      dones_float=dataset["dones_float"],
   )
 
 

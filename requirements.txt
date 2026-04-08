@@ -1,5 +1,8 @@
+# 完整复现（含 D4RL Walker 等 MuJoCo 基准）用本文件。
+# 仅做毕设 ETF / 不跑机器人基准时，请用 requirements-thesis.txt，无需 MuJoCo、d4rl、box2d。
 joblib
 gtimer
+ml_collections
 d4rl
 wandb
 flax

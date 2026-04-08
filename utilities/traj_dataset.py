@@ -16,7 +16,6 @@
 
 import collections
 
-import d4rl
 import gym
 import numpy as np
 from tqdm import tqdm
@@ -30,6 +29,9 @@ Batch = collections.namedtuple(
 def split_into_trajectories(
   observations, actions, rewards, masks, dones_float, next_observations
 ):
+  # 注意：下面这一段就是「先按 trajectory 切分」：
+  # 把原始按时间拼接的一长串 (s, a, r, ..., done_float) 序列，
+  # 按 dones_float[i] == 1.0 的位置切开，拆成多条 episode 级别的 trajectories。
   trajs = [[]]
 
   for i in tqdm(range(len(observations))):
@@ -86,6 +88,8 @@ class D4RLDataset(Dataset):
   def __init__(
     self, env: gym.Env, clip_to_eps: bool = True, eps: float = 1e-5
   ):
+    import d4rl
+
     self.raw_dataset = dataset = d4rl.qlearning_dataset(env)
 
     if clip_to_eps:
@@ -126,8 +130,18 @@ def compute_returns(traj):
 
 
 def get_traj_dataset(env, sorting=True, norm_reward=False):
+  """从 D4RL env 拿到原始数据后，切成多条 trajectory，并做可选的排序/归一化。
+
+  调用关系：
+  - 这里是 get_nstep_dataset 的「前置步骤」：get_nstep_dataset 会先调用它拿到 trajs，
+    再在每条 traj 上做 n-step 卷积；然后 get_d4rl_dataset 又在 get_nstep_dataset 之上做一层改装。
+  - Trainer 最终只看 get_d4rl_dataset 返回的 dict，这里属于底层数据预处理。
+  """
+  # env 既可以是字符串（env 名），也可以是 gym.Env，这里统一成 env 实例。
   env = gym.make(env) if isinstance(env, str) else env
+  # 用 D4RLDataset 封装 d4rl.qlearning_dataset(env)，得到一条长序列形式的原始数据。
   dataset = D4RLDataset(env)
+  # 用前面写的 split_into_trajectories 按 dones_float 把长序列切成多条 traj。
   trajs = split_into_trajectories(
     dataset.observations,
     dataset.actions,
@@ -136,32 +150,44 @@ def get_traj_dataset(env, sorting=True, norm_reward=False):
     dataset.dones_float,
     dataset.next_observations,
   )
+  # 若 sorting=True，则按整条 traj 的 return 排序（高/低回报在前/后），
+  # 主要是数据组织习惯，对训练理解不是关键，可以先不深究为什么要排序。
   if sorting:
     trajs.sort(key=compute_returns)
 
+  # 若 norm_reward=True，则按「轨迹 return 的极差」做一个简单归一化，
+  # 把不同任务的 reward 尺度 roughly scale 到类似范围；细节可暂时忽略。
   if norm_reward:
     returns = [compute_returns(traj) for traj in trajs]
     norm = (max(returns) - min(returns)) / 1000
     for traj in tqdm(trajs):
       for i, ts in enumerate(traj):
+        # ts 结构是 (obs, action, reward, mask, done_float, next_obs)
+        # 这里只把第 3 个元素 reward 除以 norm，其它保持不变。
         traj[i] = ts[:2] + (ts[2] / norm,) + ts[3:]
 
+  # 返回两部分：
+  # - trajs：已按需要切好/排好/归一化的轨迹列表，供 get_nstep_dataset 做 n-step。
+  # - raw_dataset：原始 d4rl.qlearning_dataset(env) 的 dict 版本（未排序），
+  #   仅用于做一些一致性校验（长度/shape 等），训练过程一般不会直接用到。
   # NOTE: this raw_dataset is not sorted
   return trajs, dataset.raw_dataset
 
 
 def nstep_reward_prefix(rewards, nstep=5, gamma=0.9):
+  # 这里是一个独立的 n-step 前缀和实现：
+  # 给定单条轨迹的 reward 序列 rewards[0:L]，和长度为 n 的折扣权重 [1, γ, ..., γ^{n-1}]，
+  # 用一维卷积 np.convolve 实现
+  #   R_t^{(n)} = sum_{i=0}^{n-1} γ^i * rewards[t+i]
+  # 的「窗口滑动加权和」，并通过 [nstep-1:] 做好对齐与截断。
   gammas = np.array([gamma**i for i in range(nstep)])
   nstep_rewards = np.convolve(rewards, gammas)[nstep - 1:]
   return nstep_rewards
 
 
-def get_nstep_dataset(
-  env, nstep=5, gamma=0.9, sorting=True, norm_reward=False
-):
+def get_nstep_dataset_from_trajs(trajs, nstep, gamma, raw_transition_count):
+  """对已由 split_into_trajectories 得到的轨迹列表做 n-step 回报与 next_obs 对齐。"""
   gammas = np.array([gamma**i for i in range(nstep)])
-  trajs, raw_dataset = get_traj_dataset(env, sorting, norm_reward)
-
   obss, acts, terms, next_obss, nstep_rews, dones_float = [], [], [], [], [], []
   for traj in trajs:
     L = len(traj)
@@ -181,9 +207,18 @@ def get_nstep_dataset(
   dataset["rewards"] = np.concatenate(nstep_rews)
   dataset["terminals"] = np.stack(terms)
   dataset["dones_float"] = np.stack(dones_float)
-  raw_shape = raw_dataset["next_observations"].shape
 
-  assert len(dataset["rewards"]) == len(raw_dataset["rewards"])
-  assert dataset["next_observations"].shape == raw_shape
+  assert len(dataset["rewards"]) == raw_transition_count
+  assert dataset["next_observations"].shape[0] == raw_transition_count
 
+  return dataset
+
+
+def get_nstep_dataset(
+  env, nstep=5, gamma=0.9, sorting=True, norm_reward=False
+):
+  trajs, raw_dataset = get_traj_dataset(env, sorting, norm_reward)
+  raw_count = len(raw_dataset["rewards"])
+  dataset = get_nstep_dataset_from_trajs(trajs, nstep, gamma, raw_count)
+  assert dataset["next_observations"].shape == raw_dataset["next_observations"].shape
   return dataset

@@ -1,0 +1,35 @@
+{
+  "name": "lightweight_baseline_g1_selected",
+  "created_at": "2026-04-07",
+  "purpose": "Frozen baseline config selected on validation split before EDP formal training",
+  "selection_source": "outputs_portfolio/batch_train_val_test_2026_04_07_21_19_04/batch_summary_mean_std.csv",
+  "selection_rule": {
+    "priority": [
+      "higher val_cum_return_mean",
+      "lower val_cum_return_std",
+      "lower val_max_drawdown_mean",
+      "lower val_max_drawdown_std"
+    ],
+    "selected_group": "g1"
+  },
+  "config": {
+    "n_iter": 200,
+    "pop_size": 24,
+    "sigma": 0.1,
+    "lr": 0.2,
+    "fee_rate": 0.001,
+    "seeds": [42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
+    "run_test": false
+  },
+  "validation_summary": {
+    "n_runs": 10,
+    "val_cum_return_mean": 0.509229,
+    "val_cum_return_std": 0.00548,
+    "val_sharpe_daily_mean": 0.293901,
+    "val_sharpe_daily_std": 0.003893,
+    "val_max_drawdown_mean": 0.06393,
+    "val_max_drawdown_std": 0.000342
+  },
+  "reproduce_command": "python experiments/run_portfolio_train_val_test.py --batch --seeds 42,43,44,45,46,47,48,49,50,51 --groups \"g1:n_iter=200,pop_size=24,sigma=0.10,lr=0.20,fee_rate=0.001\"",
+  "note": "Keep test split sealed until final comparison with EDP."
+}

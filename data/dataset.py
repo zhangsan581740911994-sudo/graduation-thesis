@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dataset utils."""
+"""Dataset utils. acme/tf/tfds/rl_unplugged imported lazily to avoid courier/protobuf ABI issues when using D4RL only."""
 import os
 
-import d4rl
 import gym
 import numpy as np
-import tensorflow as tf
-import tensorflow_datasets as tfds
-from acme import types
-from acme.tf import utils as tf2_utils
-from dm_env import StepType
 from gym import spaces
-from rl_unplugged import dm_control_suite
 
 
 class Dataset(object):
@@ -64,6 +57,12 @@ class Dataset(object):
 class RLUPDataset(object):
   """RL Uplugged dataset."""
   def __init__(self, task_class, task_name, dataset_path, num_threads=8, batch_size=256, num_shards=100, shuffle_buffer_size=100, action_clipping=1, sarsa=True) -> None:
+    import tensorflow as tf
+    import tensorflow_datasets as tfds
+    from acme import types
+    from acme.tf import utils as tf2_utils
+    from rl_unplugged import dm_control_suite
+
     self._batch_size = batch_size
     self._num_shards = num_shards
     self._shuffle_buffer_size = shuffle_buffer_size
@@ -122,10 +121,11 @@ class RLUPDataset(object):
 
     _ds = _ds.map(discard_extras).batch(self._batch_size).map(post_proc, num_parallel_calls=tf.data.AUTOTUNE)
     self._ds = iter(_ds)
+    self._tfds = tfds
 
   def sample(self):
     data = next(self._ds)
-    batch = tfds.as_numpy(data)
+    batch = self._tfds.as_numpy(data)
     return batch
 
   @property
@@ -163,6 +163,7 @@ class DM2Gym(object):
     )
   
   def step(self, action):
+    from dm_env import StepType
     ts = self._env.step(action)
     obs = ts.observation
     reward = ts.reward
@@ -180,6 +181,8 @@ class DM2Gym(object):
     return self._wrap_obs(ts.observation)
   
   def _wrap_obs(self, obs):
+    from acme.tf import utils as tf2_utils
+    import tensorflow_datasets as tfds
     obs = tf2_utils.add_batch_dim(obs)
     obs = tf2_utils.batch_concat(obs)
     return tfds.as_numpy(obs)

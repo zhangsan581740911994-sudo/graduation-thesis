@@ -1,0 +1,20 @@
+# 毕设 / ETF（--dataset=etf），无 MuJoCo / D4RL 机器人基准。
+# Windows：orbax-checkpoint 须先于 flax（避免拉取依赖 uvloop 的 0.11+）。
+# 安装：pip install -U pip && pip install -r requirements-thesis.txt
+
+numpy>=1.22,<3
+pandas>=1.3
+gym>=0.21,<0.26
+jax==0.4.35
+jaxlib==0.4.35
+orbax-checkpoint==0.5.16
+flax==0.8.4
+optax==0.1.9
+chex==0.1.86
+distrax>=0.1.3
+ml_collections>=0.1.0
+absl-py
+tqdm
+cloudpickle
+wandb
+python-dateutil

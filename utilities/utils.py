@@ -107,6 +107,13 @@ class WandBLogger(object):
     if self.config.random_delay > 0:
       time.sleep(np.random.uniform(0, self.config.random_delay))
 
+    # Windows / 无网络：offline 仍会起本地 service，可能超时；设 WANDB_DISABLED=1 则完全关闭 wandb。
+    _wd = os.environ.get("WANDB_DISABLED", "").lower()
+    if _wd in ("1", "true", "yes"):
+      wb_mode = "disabled"
+    else:
+      wb_mode = "online" if self.config.online else "offline"
+
     self.run = wandb.init(
       entity=self.config.team,
       reinit=True,
@@ -120,7 +127,7 @@ class WandBLogger(object):
         start_method="thread",
         _disable_stats=True,
       ),
-      mode="online" if self.config.online else "offline",
+      mode=wb_mode,
     )
 
   def log(self, *args, **kwargs):

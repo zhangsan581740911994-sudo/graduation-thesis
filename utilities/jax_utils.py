@@ -79,4 +79,4 @@ def value_and_multi_grad(fun, n_outputs, argnums=0, has_aux=False):
 
 @jax.jit
 def batch_to_jax(batch):
-  return jax.tree_map(jax.device_put, batch)
+  return jax.tree_util.tree_map(jax.device_put, batch)

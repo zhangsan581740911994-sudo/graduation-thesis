@@ -34,7 +34,7 @@ def mean_flat(tensor):
   """
   return tensor.mean(axis=list(range(1, len(tensor.shape))))
 
-
+# 根据名称获取 beta 调度
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
   """
   Get a pre-defined beta schedule for the given name.
@@ -44,28 +44,42 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
   Beta schedules may be added, but should not be removed or changed once
   they are committed to maintain backwards compatibility.
   """
+
+  # 线性调度
   if schedule_name == "linear":
     # Linear schedule from Ho et al, extended to work for any number of
     # diffusion steps.
     # NOTE: Double check beta start and end
+    # 计算 scale 参数
     scale = 1000 / num_diffusion_timesteps
     # scale = 1.0
     beta_start = scale * 0.0001
+    # 计算 beta 结束值
     beta_end = scale * 0.02
+    # 返回 beta 数组
     return np.linspace(
       beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
     )
+  # 余弦调度
   elif schedule_name == "cosine":
+    # 返回 beta 数组
     return betas_for_alpha_bar(
       num_diffusion_timesteps,
       lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2)**2,
     )
+  # VP(Variance Preserving) 调度
   elif schedule_name == "vp":
+    # 计算 T 参数
     T = num_diffusion_timesteps
+    # 计算 t 数组
     t = np.arange(1, T + 1)
+    # 计算 b_max 参数
     b_max = 10.
+    # 计算 b_min 参数
     b_min = 0.1
+    # 计算 alpha 数组
     alpha = np.exp(-b_min / T - 0.5 * (b_max - b_min) * (2 * t - 1) / T**2)
+    # 计算 beta 数组
     betas = 1 - alpha
     return betas
   else:
@@ -144,7 +158,7 @@ class GaussianDiffusion:
                             model so that they are always scaled like in the
                             original paper (0 to 1000).
   """
-
+  # 初始化扩散模型
   def __init__(
     self,
     *,
@@ -157,6 +171,7 @@ class GaussianDiffusion:
     max_value=1.,
     rescale_timesteps=False,
   ):
+    # 保存参数
     self.schedule_name = schedule_name
     self.model_mean_type = model_mean_type
     self.model_var_type = model_var_type
@@ -166,149 +181,291 @@ class GaussianDiffusion:
     self.max_value = max_value
 
     # Use float64 for accuracy.
+    # 调用函数生成 betas 数组
     betas = get_named_beta_schedule(schedule_name, num_timesteps)
     # betas = np.array(betas, dtype=np.float64)
+    # 将 betas 数组转换为 float32 类型
     betas = np.array(betas, dtype=np.float32)
+
+    # 保存 beta 数组
     self.betas = betas
+    # 确保 beta 数组是一维数组
     assert len(betas.shape) == 1, "betas must be 1-D"
+    # 确保 beta 数组在 [0, 1] 之间
     assert (betas > 0).all() and (betas <= 1).all()
 
+    # 保存时间步数
     self.num_timesteps = int(betas.shape[0])
 
+    # 计算 alpha 数组：α_t = 1 - β_t，表示第 t 步保留信号的比例
+    # 用途：用于计算累积乘积，是扩散模型的基础系数
     alphas = 1.0 - betas
+    
+    # 计算 alpha 累积积：ᾱ_t = α₁ × α₂ × ... × α_t，从 x₀ 到 x_t 的累积保留比例
+    # 用途：用于前向加噪公式 x_t = √ᾱ_t·x₀ + √(1-ᾱ_t)·ε，以及后向去噪的均值计算
     self.alphas_cumprod = np.cumprod(alphas, axis=0)
+    
+    # 计算 alpha 累积积的前一个值：ᾱ_{t-1}，前一个时间步的累积保留比例
+    # 结构：[1.0, ᾱ₁, ᾱ₂, ..., ᾱ_{T-1}]，第一个元素是 1.0（t=0 时没有前一步）
+    # 用途：计算后验分布 q(x_{t-1}|x_t, x_0) 的方差和均值系数（posterior_variance、posterior_mean_coef1/coef2），以及 DDIM 采样
     self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
+    
+    # 计算 alpha 累积积的下一个值：ᾱ_{t+1}，下一个时间步的累积保留比例
+    # 结构：[ᾱ₂, ᾱ₃, ..., ᾱ_T, 0.0]，最后一个元素是 0.0（t=T 时没有下一步）
+    # 用途：DDIM 反向采样（ddim_reverse_sample），从 x_t 采样 x_{t+1} 时需要（加噪方向）
+    # 注意：这不是用于生成加速的去噪过程（去噪用 alphas_cumprod_prev），而是用于反向加噪的特殊场景
+    # 在本项目中 ddim_reverse_sample 可能未被实际使用，但保留此变量以支持完整的 DDIM 功能
     self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
+    
+    # 确保 alpha 累积积的前一个值形状正确：长度必须等于 num_timesteps
+    # 用途：防御性检查，确保后续索引操作不会出错
     assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
 
-    # calculations for diffusion q(x_t | x_{t-1}) and others
+    # 后续会频繁用到的各种 ᾱ_t 相关系数（预先算好，避免重复开方/取对数）
+    # √ᾱ_t，用于前向加噪均值 x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε 中乘在 x0 前面的系数
     self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
+    # √(1-ᾱ_t)，用于前向加噪中乘在噪声 ε 前面的系数
     self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+    # log(1-ᾱ_t)，用于 NLL / KL 等需要 log-variance 的地方
     self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
+    # √(1/ᾱ_t)，用于从 (x_t, ε) 或 (x_t, x̂0) 反推 x̂0 时的系数
     self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
+    # √(1/ᾱ_t - 1) = √((1-ᾱ_t)/ᾱ_t)，用于在 _predict_xstart_from_eps /
+    # _predict_eps_from_xstart 里构造噪声那一项的系数
     self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
 
     # calculations for posterior q(x_{t-1} | x_t, x_0)
+    # 后验方差：σ²_post(t) = β_t * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
+    # 用途：用于计算后验分布 q(x_{t-1}|x_t, x_0) 的方差，训练时作为目标让网络学习
     self.posterior_variance = (
       betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
     )
-    # log calculation clipped because the posterior variance is 0 at the
-    # beginning of the diffusion chain.
+    # 后验方差的 log 形式（做了 clipping 处理）
+    # 原因：在扩散链开始处（t=0）后验方差可能为 0，直接取 log 会数值不稳定
+    # 处理：把第一个时间步的 log-variance 设为第二个时间步的值，避免 log(0)
+    # 用途：用于 ELBO / NLL 计算中需要 log-variance 的地方
     self.posterior_log_variance_clipped = np.log(
       np.append(self.posterior_variance[1], self.posterior_variance[1:])
     )
+    # 后验均值的系数 1：c₁(t) = β_t * √ᾱ_{t-1} / (1 - ᾱ_t)
+    # 用途：计算后验均值 μ_post(x_t, x_0) = c₁(t)·x_0 + c₂(t)·x_t 时乘在 x_0 前面的系数
     self.posterior_mean_coef1 = (
       betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
     )
+    # 后验均值的系数 2：c₂(t) = (1 - ᾱ_{t-1}) * √α_t / (1 - ᾱ_t)
+    # 用途：计算后验均值时乘在 x_t 前面的系数
     self.posterior_mean_coef2 = (
       (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) /
       (1.0 - self.alphas_cumprod)
     )
+    # 时间步权重：w_t = β_t / (2 * (1 - ᾱ_t) * α_t)
+    # 含义：ELBO 展开后，不同时间步 t 的 KL 项对总 loss 的贡献权重（理论推导得出）
+    # 用途：在 training_losses 中用于加权 MSE，让不同时间步的 loss 贡献更合理
     self.ts_weights = ws = betas / (2 * (1 - self.alphas_cumprod) * alphas)
+    # 归一化后的时间步权重：将权重归一化，使总权重保持稳定
+    # 用途：用于更精细地控制训练时不同时间步的 loss 权重分配
     self.normalized_ts_weights = ws * num_timesteps / ws.sum()
 
   def q_mean_variance(self, x_start, t):
     """
-    Get the distribution q(x_t | x_0).
-
-    :param x_start: the [N x C x ...] tensor of noiseless inputs.
-    :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-    :return: A tuple (mean, variance, log_variance), all of x_start's shape.
+    计算前向分布 q(x_t | x_0) 的均值、方差和 log 方差。
+    
+    前向加噪公式：x_t = √ᾱ_t·x_0 + √(1-ᾱ_t)·ε，其中 ε ~ N(0,I)
+    因此 q(x_t | x_0) = N(x_t; √ᾱ_t·x_0, (1-ᾱ_t)I)
+    
+    :param x_start: 干净输入 x_0，形状 [N x C x ...]（N 是 batch size，C 是特征维度）
+    :param t: 时间步索引数组，形状 [N]，每个元素表示对应样本的时间步（0 表示第 1 步）
+    :return: 三元组 (mean, variance, log_variance)，都是 x_start 的形状
+             - mean: q(x_t | x_0) 的均值，即 √ᾱ_t·x_0
+             - variance: q(x_t | x_0) 的方差，即 1-ᾱ_t
+             - log_variance: 方差的 log 形式，即 log(1-ᾱ_t)，用于 KL 散度等计算
+    
+    用途：用于计算前向分布的统计量，在 _prior_bpd 等函数中用于计算 KL 散度
     """
+    # 均值：μ_t = √ᾱ_t·x_0
+    # _extract_into_tensor 根据时间步 t 从数组中提取对应的系数
     mean = (
       _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) *
       x_start
     )
+    
+    # 方差：σ²_t = 1 - ᾱ_t
+    # 前向加噪时，噪声的方差是 1-ᾱ_t
     variance = _extract_into_tensor(
       1.0 - self.alphas_cumprod, t, x_start.shape
     )
+    
+    # log 方差：log(σ²_t) = log(1 - ᾱ_t)
+    # 用于 KL 散度等需要 log-variance 的计算（避免数值不稳定）
     log_variance = _extract_into_tensor(
       self.log_one_minus_alphas_cumprod, t, x_start.shape
     )
     return mean, variance, log_variance
-
+  
+  # 前向加噪函数
   def q_sample(self, x_start, t, noise):
     """
-    Diffuse the data for a given number of diffusion steps.
-
-    In other words, sample from q(x_t | x_0).
-
-    :param x_start: the initial data batch.
-    :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
-    :param noise: the split-out normal noise.
-    :return: A noisy version of x_start.
+    前向加噪：从 q(x_t | x_0) 采样，对干净数据 x_0 加噪得到 x_t。
+    
+    数学公式：x_t = √ᾱ_t·x_0 + √(1-ᾱ_t)·ε
+    其中 ε ~ N(0,I) 是标准高斯噪声，ᾱ_t 是累积保留比例。
+    
+    :param x_start: 干净输入 x_0，形状 [N x C x ...]（N 是 batch size，C 是特征维度）
+                    在扩散策略中，x_0 是真实动作（来自数据集）
+    :param t: 时间步索引数组，形状 [N]，每个元素表示对应样本的时间步（0 表示第 1 步）
+              不同的样本可以有不同的时间步，实现 batch 内并行训练
+    :param noise: 预采样的高斯噪声 ε，形状与 x_start 相同，通常从 N(0,I) 采样得到
+                  注意：噪声需要提前采样好传入，而不是在函数内部采样
+    :return: 加噪后的数据 x_t，形状与 x_start 相同
+    
+    用途：训练时用于对真实动作加噪，得到训练样本 (x_t, t)，然后让网络预测噪声
+    调用位置：主要在 training_losses 中使用（第 790 行）
+    
+    设计说明：
+    - 使用 self.sqrt_alphas_cumprod 等：系数在 __init__ 中预先计算好（所有时间步），避免重复计算
+    - 使用 _extract_into_tensor：根据时间步 t 动态提取对应的系数（batch 内不同样本可能有不同时间步）
     """
+    # 确保噪声和初始数据形状相同，防止维度不匹配的错误
     assert noise.shape == x_start.shape
-    return (
-      _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) *
-      x_start + _extract_into_tensor(
-        self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
-      ) * noise
-    )
-
+    
+    # 前向加噪公式：x_t = √ᾱ_t·x_0 + √(1-ᾱ_t)·ε
+    # 第一部分：√ᾱ_t·x_0（保留的信号部分）
+    # _extract_into_tensor 根据时间步 t 从预先计算的数组中提取对应的系数
+    signal_part = _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+    
+    # 第二部分：√(1-ᾱ_t)·ε（添加的噪声部分）
+    # _extract_into_tensor 根据时间步 t 从预先计算的数组中提取对应的系数
+    noise_part = _extract_into_tensor(
+      self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
+    ) * noise
+    
+    # 返回加噪后的数据
+    return signal_part + noise_part
+  
+  # 前向过程的后验（给定 x_0 时 q(x_{t-1}|x_t,x_0) 的闭式，非学到的反向）
   def q_posterior_mean_variance(self, x_start, x_t, t):
     """
-    Compute the mean and variance of the diffusion posterior:
-
-        q(x_{t-1} | x_t, x_0)
-
+    计算前向过程的后验分布 q(x_{t-1} | x_t, x_0) 的均值、方差和 log 方差。
+    
+    这是前向过程的解析后验（闭式解，不依赖网络），通过贝叶斯公式和高斯分布的共轭性质推导得出。
+    训练时用作目标，让网络学习的分布 p_θ(x_{t-1}|x_t) 去拟合这个后验。
+    
+    数学公式：
+    - 均值：μ_post = c₁(t)·x_0 + c₂(t)·x_t，其中 c₁、c₂ 在 __init__ 中预先计算
+    - 方差：σ²_post = β_t·(1-ᾱ_{t-1})/(1-ᾱ_t)
+    
+    :param x_start: 干净输入 x_0，形状 [N x C x ...]
+    :param x_t: 加噪后的数据 x_t，形状与 x_start 相同
+    :param t: 时间步索引数组，形状 [N]，每个元素表示对应样本的时间步
+    :return: 三元组 (posterior_mean, posterior_variance, posterior_log_variance_clipped)
+             - posterior_mean: 后验均值，形状与 x_start 相同
+             - posterior_variance: 后验方差，形状与 x_start 相同
+             - posterior_log_variance_clipped: 后验方差的 log 形式（做了 clipping 处理）
+    
+    用途：训练时用于计算 ELBO 中的 KL 项，生成时用于计算 p_mean_variance 的均值
+    注意：使用 _extract_into_tensor 根据时间步 t 动态提取系数（batch 内不同样本可能有不同时间步）
     """
+    # 确保初始数据和加噪后的数据形状相同
     assert x_start.shape == x_t.shape
+    
+    # 后验均值：μ_post = c₁(t)·x_0 + c₂(t)·x_t
+    # _extract_into_tensor 根据时间步 t 从预先计算的系数数组中提取对应的值
+    # 这样设计的原因：batch 内不同样本可能有不同的时间步，需要动态提取对应的系数
     posterior_mean = (
       _extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start +
       _extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
     )
+    
+    # 后验方差：σ²_post = β_t·(1-ᾱ_{t-1})/(1-ᾱ_t)
+    # 在 __init__ 中预先计算好所有时间步的方差，这里根据 t 动态提取
     posterior_variance = _extract_into_tensor(
       self.posterior_variance, t, x_t.shape
     )
+    
+    # 后验方差的 log 形式（做了 clipping 处理，避免 log(0)）
+    # 在 __init__ 中已经做了 clipping（第一个时间步用第二个时间步的值），这里直接提取
     posterior_log_variance_clipped = _extract_into_tensor(
       self.posterior_log_variance_clipped, t, x_t.shape
     )
+    
+    # 确保返回值的 batch 维度一致
     assert (
       posterior_mean.shape[0] == posterior_variance.shape[0] ==
       posterior_log_variance_clipped.shape[0] == x_start.shape[0]
     )
     return posterior_mean, posterior_variance, posterior_log_variance_clipped
-
+  
+  # 学到的反向去噪 p(x_{t-1}|x_t)，依赖模型输出
   def p_mean_variance(self, model_output, x, t, clip_denoised=True):
     """
-    Apply the model to get p(x_{t-1} | x_t), as well as a prediction of
-    the initial x, x_0.
-
-    :param model_output: the model prediction, which takes a signal and a
-                         batch of timesteps as input.
-    :param x: the [N x C x ...] tensor at time t.
-    :param t: a 1-D Tensor of timesteps.
-    :param clip_denoised: if True, clip the denoised signal into [-1, 1].
-    :return: a dict with the following keys:
-             - 'mean': the model mean output.
-             - 'variance': the model variance output.
-             - 'log_variance': the log of 'variance'.
-             - 'pred_xstart': the prediction for x_0.
+    计算学到的反向分布 p(x_{t-1} | x_t) 的均值、方差和预测的 x_0。
+    
+    这是扩散模型的核心函数：用网络输出计算去噪分布。关键思想是：
+    - 网络预测噪声 ε（或 x_0，或 x_{t-1}），根据 model_mean_type 决定
+    - 从网络输出得到 pred_xstart（预测的 x_0）
+    - 用 q_posterior_mean_variance 的公式，但把真实 x_0 换成预测的 pred_xstart
+    - 这样得到 p(x_{t-1}|x_t) 的均值（方差由 schedule 固定或网络学习）
+    
+    数学公式：
+    - 均值：μ_p = c₁(t)·pred_xstart + c₂(t)·x_t（用 q 的后验公式，x_0 换成预测值）
+    - 方差：由 model_var_type 决定（固定或学习）
+    
+    :param model_output: 网络的输出，根据 model_mean_type 可能是：
+                         - EPSILON：预测的噪声 ε（本项目默认）
+                         - START_X：直接预测的 x_0
+                         - PREVIOUS_X：直接预测的 x_{t-1}
+    :param x: 当前时间步的数据 x_t，形状 [N x C x ...]
+    :param t: 时间步索引数组，形状 [N]
+    :param clip_denoised: 如果为 True，将 pred_xstart 裁剪到 [min_value, max_value]
+    :return: 字典，包含以下键：
+             - 'mean': p(x_{t-1}|x_t) 的均值，形状与 x 相同
+             - 'variance': p(x_{t-1}|x_t) 的方差，形状与 x 相同
+             - 'log_variance': 方差的 log 形式
+             - 'pred_xstart': 网络预测的 x_0，形状与 x 相同
+    
+    用途：训练时用于计算 loss，生成时用于采样 x_{t-1}
+    关键：用同一套 q 的后验公式，只是 x_0 换成预测值（训练时用真实 x_0，生成时用预测 x_0）
     """
+    # 获取数据形状：B = batch size（批次大小）, C = action_dim（动作维度）
+    # 在扩散策略中，x 是动作（action），形状通常是 [batch_size, action_dim]
+    # 例如：x.shape = [32, 14] 表示 32 个样本，每个动作是 14 维 → B=32, C=14
+    # x.shape[:2] 表示取形状的前两个维度
+    # 这是 Python 的解包语法：将元组 (32, 14) 解包给 B 和 C
     B, C = x.shape[:2]
 
+    # ===== 第一部分：计算方差 =====
+    # 根据 model_var_type 决定方差是固定的还是学习的
     if self.model_var_type in [
       ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE
     ]:
+      # 学习方差：网络同时输出均值和方差
+      # 此时 model_output 的形状是 [B, C*2, ...]，前一半是均值，后一半是方差
       assert model_output.shape == (B, C * 2, *x.shape[2:])
+      # 拆分：前一半是均值预测，后一半是方差预测
+      # np.split(model_output, C, axis=1)：在 axis=1（特征维度）上分割
+      # 将 [B, C*2, ...] 分成两个 [B, C, ...] 的数组
+      # axis=1 表示在第 1 个维度（索引从 0 开始，所以是第 2 个维度）上分割
       model_output, model_var_values = np.split(model_output, C, axis=1)
+      
       if self.model_var_type == ModelVarType.LEARNED:
+        # 网络直接输出 log-variance
         model_log_variance = model_var_values
         model_variance = np.exp(model_log_variance)
       else:
+        # LEARNED_RANGE：网络输出 [-1, 1] 的值，映射到 [min_var, max_var] 范围
         min_log = _extract_into_tensor(
           self.posterior_log_variance_clipped, t, x.shape
         )
         max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-        # The model_var_values is [-1, 1] for [min_var, max_var].
+        # 将 [-1, 1] 映射到 [min_log, max_log]
         frac = (model_var_values + 1) / 2
         model_log_variance = frac * max_log + (1 - frac) * min_log
         model_variance = np.exp(model_log_variance)
     else:
+      # 固定方差：方差由 schedule 决定，不学习（本项目默认 FIXED_SMALL）
+      # 注意：这里用的是数学闭式解（预先在 __init__ 中计算好的数组）
+      # 不是抽样，而是从预先计算的数组中提取对应时间步的值
       model_variance, model_log_variance = {
-        # for fixedlarge, we set the initial (log-)variance like so
-        # to get a better decoder log likelihood.
         ModelVarType.FIXED_LARGE:
           (
             np.append(self.posterior_variance[1], self.betas[1:]),
@@ -316,38 +473,61 @@ class GaussianDiffusion:
           ),
         ModelVarType.FIXED_SMALL:
           (
-            self.posterior_variance,
-            self.posterior_log_variance_clipped,
+            self.posterior_variance,  # 使用后验方差（数学闭式解）
+            self.posterior_log_variance_clipped,  # 使用后验 log-variance（数学闭式解）
           ),
       }[self.model_var_type]
+      # 根据时间步 t 动态提取对应的方差
+      # _extract_into_tensor 不是抽样，而是从预先计算的数组中提取对应时间步的值
+      # 因为 batch 内不同样本可能有不同的时间步，需要动态提取
       model_variance = _extract_into_tensor(model_variance, t, x.shape)
       model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
-
+    
+    # ===== 第二部分：计算均值和 pred_xstart =====
+    # 辅助函数：如果需要，将 pred_xstart 裁剪到有效范围
     def process_xstart(x):
       if clip_denoised:
         return x.clip(self.min_value, self.max_value)
       return x
-
+    
+    # 根据 model_mean_type 决定网络预测什么，然后转换成 pred_xstart
+    # 注意：pred_xstart 有两个用途：
+    # 1. 生成时：用于反向去噪（从 x_t 去噪到 x_{t-1}）
+    # 2. 训练时：用于 action approximation（EDP/DQL 的 guide loss）
+    #    在 dql.py 的 get_diff_terms 中，pred_xstart 被当作预测的动作用于计算 Q(s, a)
     if self.model_mean_type == ModelMeanType.PREVIOUS_X:
+      # 网络直接预测 x_{t-1}
+      # 这种情况较少见，需要从 x_{t-1} 反推 x_0
       pred_xstart = process_xstart(
         self._predict_xstart_from_xprev(x_t=x, t=t, xprev=model_output)
       )
-      model_mean = model_output
+      model_mean = model_output  # 均值就是网络输出
     elif self.model_mean_type in [
       ModelMeanType.START_X, ModelMeanType.EPSILON
     ]:
       if self.model_mean_type == ModelMeanType.START_X:
+        # 网络直接预测 x_0（较少用）
         pred_xstart = process_xstart(model_output)
       else:
+        # 网络预测噪声 ε（本项目默认），需要反推 x_0
+        # 公式：x_0 = (x_t - √(1-ᾱ_t)·ε) / √ᾱ_t
+        # 这是标准的扩散模型公式，不是 EDP 特有的
         pred_xstart = process_xstart(
           self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
         )
+      
+      # 关键步骤：用 q_posterior_mean_variance 的公式计算均值
+      # 但把真实 x_0 换成预测的 pred_xstart
+      # 这样得到 p(x_{t-1}|x_t) 的均值 = c₁(t)·pred_xstart + c₂(t)·x_t
+      # 这是 DQL/EDP 的标准做法，不是 action approximation
+      # action approximation 是在训练时用 pred_xstart 当作动作计算 guide loss（见 dql.py 第 311-313 行）
       model_mean, _, _ = self.q_posterior_mean_variance(
         x_start=pred_xstart, x_t=x, t=t
       )
     else:
       raise NotImplementedError(self.model_mean_type)
 
+    # 确保所有返回值的形状一致
     assert (
       model_mean.shape == model_log_variance.shape == pred_xstart.shape ==
       x.shape
@@ -359,13 +539,16 @@ class GaussianDiffusion:
       "pred_xstart": pred_xstart,
     }
 
+  # 后向去噪函数（简化版本，另一种实现方式）
   def p_mean_variance_(self, model_output, x, t, clip_denoised=True):
 
+    # 处理初始数据
     def process_xstart(x):
       if clip_denoised:
         return x.clip(self.min_value, self.max_value)
       return x
 
+    # 根据模型均值类型选择不同的均值
     if self.model_mean_type == ModelMeanType.START_X:
       pred_xstart = process_xstart(model_output)
     elif self.model_mean_type == ModelMeanType.EPSILON:
@@ -461,37 +644,65 @@ class GaussianDiffusion:
     model_kwargs=None,
   ):
     """
-    Sample x_{t-1} from the model at the given timestep.
-
-    :param rng: RNGKey for random sampling.
-    :param model_output: the model prediction to sample from.
-    :param x: the current tensor at x_{t-1}.
-    :param t: the value of t, starting at 0 for the first diffusion step.
-    :param clip_denoised: if True, clip the x_start prediction to [-1, 1].
-    :param denoised_fn: if not None, a function which applies to the
-        x_start prediction before it is used to sample.
-    :param cond_fn: if not None, this is a gradient function that acts
-                    similarly to the model.
-    :param model_kwargs: if not None, a dict of extra keyword arguments to
-        pass to the model. This can be used for conditioning.
-    :return: a dict containing the following keys:
-             - 'sample': a random sample from the model.
-             - 'pred_xstart': a prediction of x_0.
+    从 x_t 采样 x_{t-1}：根据网络预测的噪声，计算均值，再加随机噪声采样。
+    
+    流程：
+    1. 用 p_mean_variance 计算 p(x_{t-1}|x_t) 的均值 μ 和方差 σ²
+       - 内部会预测 x_0（pred_xstart），但输出的是均值 μ = c₁(t)·pred_x0 + c₂(t)·x_t
+    2. 在均值 μ 上加随机噪声：x_{t-1} = μ + σ·ε，其中 ε ~ N(0,I)
+    3. 注意：不是直接在预测的 x_0 上加噪声，而是在均值 μ 上加噪声
+    
+    :param rng: JAX 随机数生成器密钥
+    :param model_output: 网络预测的噪声 ε（或 x_0，由 model_mean_type 决定）
+    :param x: 当前时间步的数据 x_t，形状 [N x C x ...]
+    :param t: 时间步索引数组，形状 [N]
+    :param clip_denoised: 无需了解：是否裁剪 pred_xstart（默认即可）
+    :param cond_fn: 无需了解：条件生成函数（本项目不使用）
+    :param model_kwargs: 无需了解：额外的模型参数（本项目不使用）
+    :return: 字典，包含：
+             - 'sample': 采样的 x_{t-1}，形状与 x 相同
+             - 'pred_xstart': 预测的 x_0，形状与 x 相同
     """
+    # 计算 p(x_{t-1}|x_t) 的均值 μ 和方差 σ²（内部会预测 x_0，但输出的是均值）
     out = self.p_mean_variance(model_output, x, t, clip_denoised=clip_denoised)
+    # 采样随机噪声 ε ~ N(0,I)，形状与 x 相同
     noise = jax.random.normal(rng, x.shape, dtype=x.dtype)
 
-    # nonzero_mask = (
-    #   (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-    # )  # no noise when t == 0
-    # nonzero_mask = (
-    #   (t != 0).astype(np.float32).reshape((-1, *([1] * (len(x.shape) - 1))))
-    # )
+    # 当 t=0 时，不加噪声（因为已经是 x_0 了）
+    # nonzero_mask：t != 0 时为 1，t == 0 时为 0
     nonzero_mask = np.expand_dims((t != 0).astype(np.float32), axis=-1)
+    
+    # 无需了解：条件生成（本项目不使用）
     if cond_fn is not None:
       out["mean"] = self.condition_mean(
         cond_fn, out, x, t, model_kwargs=model_kwargs
       )
+    
+    # ===== 重要：DDPM 的随机噪声不能为 0 =====
+    # 
+    # DDPM 的采样公式：x_{t-1} = μ + σ·ε（当 t != 0 时）
+    # 其中：
+    #   - μ = out["mean"]（后验分布的均值，来自 q_posterior_mean_variance）
+    #   - σ = exp(0.5 * out["log_variance"])（后验分布的方差）
+    #   - ε ~ N(0,I)（随机噪声）
+    # 
+    # DDPM 的 σ 来自哪里？
+    #   - 来自 posterior_variance = betas * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)
+    #   - 这是由 beta schedule 决定的（在 __init__ 中预先计算，第 240-241 行）
+    #   - 因为 betas > 0（噪声强度不能为 0），所以 σ > 0（不能为 0）
+    # 
+    # 为什么 DDPM 不能取 eta=0？
+    #   - DDPM 根本没有 eta 参数！eta 是 DDIM 特有的参数
+    #   - DDPM 的随机性来自后验分布的方差 σ（由 beta schedule 决定），不能为 0
+    #   - DDIM 的随机性来自 eta 参数，可以设为 0（sigma = eta * sqrt(...)）
+    # 
+    # 对比：
+    #   - DDPM：x_{t-1} = μ + σ·ε，其中 σ > 0（由 beta schedule 决定），每步都有随机性
+    #   - DDIM：x_{t-1} = mean_pred + sigma * noise，其中 sigma = eta * sqrt(...)
+    #           当 eta=0 时，sigma=0，完全确定性
+    # 
+    # 采样公式：x_{t-1} = μ + σ·ε（当 t != 0 时）
+    # 注意：这是在均值 μ 上加噪声，不是在预测的 x_0 上加噪声
     sample = out["mean"] + \
       nonzero_mask * np.exp(0.5 * out["log_variance"]) * noise
     return {"sample": sample, "pred_xstart": out["pred_xstart"]}
@@ -506,33 +717,71 @@ class GaussianDiffusion:
     model_kwargs=None,
   ):
     """
-    Generate samples from the model.
-
-    :param model_forward: the model apply function without passing params.
-    :param shape: the shape of the samples, (N, C, H, W).
-    :param noise: if specified, the noise from the encoder to sample.
-                  Should be of the same shape as `shape`.
-    :param clip_denoised: if True, clip x_start predictions to [-1, 1].
-    :param denoised_fn: if not None, a function which applies to the
-        x_start prediction before it is used to sample.
-    :param cond_fn: if not None, this is a gradient function that acts
-                    similarly to the model.
-    :param model_kwargs: if not None, a dict of extra keyword arguments to
-        pass to the model. This can be used for conditioning.
-    :return: a non-differentiable batch of samples.
+    扩散模型的生成循环：从噪声 x_T 逐步去噪到 x_0（动作）。
+    
+    这是扩散模型生成时的核心函数：完整 T 步去噪，每步调用网络预测噪声，然后采样 x_{t-1}。
+    
+    流程：
+    1. 从纯噪声 x_T ~ N(0,I) 开始
+    2. 循环 T 步（从 T-1 到 0）：
+       - 网络预测噪声：ε_pred = model_forward(x_t, t)
+       - 采样 x_{t-1}：用 p_sample 根据预测的噪声采样下一步
+    3. 返回最终的动作 x_0
+    
+    :param rng_key: JAX 随机数生成器密钥
+    :param model_forward: 噪声预测网络的函数，输入 (x_t, t)，输出预测的噪声 ε
+                         在 DiffusionPolicy 中，这是 partial(self.base_net, observations)
+                         说明：partial 是 Python 的 functools.partial，可以"固定"函数的某些参数
+                         例如：base_net(obs, x_t, t) 需要三个参数
+                              partial(base_net, obs) 创建一个新函数，obs 已经固定
+                              新函数只需要传 (x_t, t)，这样 p_sample_loop 调用时更方便
+    :param shape: 输出数组的形状，例如 [batch_size, action_dim] = [32, 14]
+                  表示 32 个样本，每个样本是 14 维向量（动作维度）
+                  shape 在很多函数里用来指定输出数组的形状
+    :param clip_denoised: 如果为 True，将 pred_xstart 裁剪到 [min_value, max_value]
+                         无需了解：知道是裁剪即可
+    :param cond_fn: 无需了解：条件生成函数（本项目不使用条件生成）
+    :param model_kwargs: 无需了解：额外的模型参数（本项目不使用）
+    :return: 生成的动作 x_0，形状与 shape 相同
+    
+    调用位置：在 nets.py 的 DiffusionPolicy.ddpm_sample 中被调用（第 156 行）
+    用途：生成时从噪声逐步去噪得到动作
     """
+    # ===== 第一步：从纯噪声开始 =====
     rng_key, sample_key = jax.random.split(rng_key)
-    x = jax.random.normal(sample_key, shape)
+    x = jax.random.normal(sample_key, shape)  # x_T ~ N(0,I)，形状 [batch_size, action_dim]
 
+    # ===== 第二步：循环 T 步去噪 =====
+    # 注意：循环结构看起来和 ddim_sample_loop 一样，但核心区别在于每步调用的采样函数不同：
+    # - p_sample_loop 调用 p_sample（第 748 行）：x_{t-1} = μ + σ·ε（随机采样，必须完整 T 步）
+    # - ddim_sample_loop 调用 ddim_sample（第 911 行）：x_{t-1} = mean_pred + sigma*noise（当 eta=0 时确定性，可以跳步）
+    # 
+    # p_sample 的采样公式（第 684-685 行）：每步都加随机噪声，必须完整 T 步
+    # ddim_sample 的采样公式（第 817-825 行）：当 eta=0 时完全确定性，可以跳步加速
     indices = list(range(self.num_timesteps))[::-1]
     for i in indices:
+      # 当前时间步 t = i（例如 T-1, T-2, ..., 0）
+      # shape[:-1] 表示除了最后一维的所有维度（例如 shape=[32,14] → shape[:-1]=[32]）
+      # 这样 t 的形状是 [batch_size]，每个样本都是同一个时间步 i
       t = np.ones(shape[:-1], dtype=np.int32) * i
+      
+      # 网络预测噪声：ε_pred = model_forward(x_t, t)
       model_output = model_forward(x, self._scale_timesteps(t))
+      
+      # 采样 x_{t-1}：从 x_t 采样 x_{t-1}（使用 DDPM 的随机采样公式）
+      # 流程：x_t → p_mean_variance 算均值（内部会预测 x_0，但输出的是均值 μ）→ 在均值上加随机噪声 → x_{t-1}
+      # 注意：不是直接在预测的 x_0 上加噪声，而是在均值 μ = c₁(t)·pred_x0 + c₂(t)·x_t 上加噪声
+      # p_sample 的详细实现在第 636 行，采样公式在第 684-685 行：x_{t-1} = μ + σ·ε（每步都有随机性）
       rng_key, sample_key = jax.random.split(rng_key)
       out = self.p_sample(
         sample_key, model_output, x, t, clip_denoised, cond_fn, model_kwargs
       )
+      
+      # 更新 x：x = x_{t-1}，为下一步做准备
       x = out["sample"]
+    
+    # ===== 第三步：返回最终动作 =====
+    # 循环结束后，x 就是 x_0（去噪完成，得到动作）
     return x
 
   def ddim_sample(
@@ -547,34 +796,149 @@ class GaussianDiffusion:
     eta=0.0,
   ):
     """
-    Sample x_{t-1} from the model using DDIM.
-
-    Same usage as p_sample().
+    用 DDIM 方式从 x_t 采样 x_{t-1}：确定性采样，可以跳步，比 DDPM 快。
+    
+    与 p_sample（DDPM）的区别：
+    - DDPM：每步都加随机噪声，必须完整 T 步
+    - DDIM：确定性采样（eta=0 时），可以跳步（如每 10 步采样一次），更快
+    
+    流程：
+    1. 用 p_mean_variance 计算均值（和 DDPM 相同）
+    2. 用 DDIM 公式计算 x_{t-1}（与 DDPM 的公式不同）
+       - 当 eta=0 时：完全确定性，可以跳步
+       - 当 eta>0 时：有随机性，但比 DDPM 的随机性小
+    
+    :param rng_key: JAX 随机数生成器密钥
+    :param model_putput: 网络预测的噪声 ε（或 x_0）
+    :param x: 当前时间步的数据 x_t
+    :param t: 时间步索引
+    :param clip_denoised: 无需了解：是否裁剪 pred_xstart（默认即可）
+    :param cond_fn: 无需了解：条件生成函数（本项目不使用）
+    :param model_kwargs: 无需了解：额外的模型参数（本项目不使用）
+    :param eta: 无需了解：DDIM 的随机性参数（eta=0 时完全确定性，默认即可）
+    :return: 字典，包含 'sample'（x_{t-1}）和 'pred_xstart'（预测的 x_0）
+    
+    注意：DDIM 的详细公式在第 791-799 行，无需深入理解，知道「确定性、可跳步」即可。
     """
+    # 计算 p(x_{t-1}|x_t) 的均值（和 DDPM 相同）
     out = self.p_mean_variance(model_putput, x, t, clip_denoised=clip_denoised)
+    
+    # 无需了解：条件生成（本项目不使用）
     if cond_fn is not None:
       out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
 
-    # Usually our model outputs epsilon, but we re-derive it
-    # in case we used x_start or x_prev prediction.
+    # 从 pred_xstart 反推噪声 ε（因为网络可能预测 x_0 而不是 ε）
     eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
 
+    # DDIM 公式需要的系数
     alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
     alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+    
+    # ===== 概念 1：eta（随机性参数）和 sigma（方差） =====
+    # 
+    # eta：DDIM 的随机性参数，是一个可以调节的数字（通常设为 0 或 0.5）
+    #   - eta = 0：完全确定性（每次结果相同）
+    #   - eta > 0：有随机性（每次结果可能不同）
+    # 
+    # sigma：DDIM 的方差，由 eta 计算得出
+    #   公式：sigma = eta * sqrt(...)
+    #   当 eta=0 时，sigma = 0 * sqrt(...) = 0（数学上，任何数乘以 0 都是 0）
+    #   当 eta>0 时，sigma > 0（具体值取决于时间步 t）
+    # 
+    # 简单理解：
+    #   - eta 就像"随机性的开关"：eta=0 关闭随机性，eta>0 开启随机性
+    #   - sigma 是"随机性的大小"：sigma=0 表示没有随机性，sigma>0 表示有随机性
     sigma = (
       eta * np.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar)) *
       np.sqrt(1 - alpha_bar / alpha_bar_prev)
     )
-    # Equation 12.
-    noise = jax.random.normal(rng_key, x.shape, dtype=x.dtype)
+    
+    # DDIM 采样公式（Equation 12 in DDIM paper）
+    noise = jax.random.normal(rng_key, x.shape, dtype=x.dtype)  # 随机噪声 ε ~ N(0,I)
+    
+    # ===== 重要：DDIM 的 mean_pred 与 DDPM 的 μ 是不同的！ =====
+    # 
+    # DDPM 的 μ（在 p_sample 中，第 524-526 行）：
+    #   μ = c₁(t)·pred_xstart + c₂(t)·x_t
+    #   这是后验分布 q(x_{t-1}|x_t, x_0) 的均值公式（用预测的 x_0 代替真实的 x_0）
+    #   来自 q_posterior_mean_variance 函数（第 346 行）
+    # 
+    # DDIM 的 mean_pred（这里）：
+    #   mean_pred = pred_xstart * sqrt(alpha_bar_prev) + sqrt(1 - alpha_bar_prev - sigma**2) * eps
+    #   这是 DDIM 的特殊公式，与 DDPM 的 μ 不同
+    #   注意：这里用到了 eps（从 pred_xstart 反推的噪声），而 DDPM 的 μ 不需要 eps
+    # 
+    # 为什么不同？
+    #   - DDPM 和 DDIM 是两种不同的采样方法，它们的数学公式本身就不同
+    #   - DDPM 基于随机过程（每步都加随机噪声），DDIM 基于确定性 ODE（可以没有随机性）
+    #   - 所以它们的"均值"公式也不同
+    # 
+    # 均值：用 pred_x0 和 eps 计算（DDIM 的特殊公式）
     mean_pred = (
       out["pred_xstart"] * np.sqrt(alpha_bar_prev) +
       np.sqrt(1 - alpha_bar_prev - sigma**2) * eps
     )
-    # nonzero_mask = (
-    #   (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-    # )  # no noise when t == 0
+    # 当 t=0 时，不加噪声
     nonzero_mask = np.expand_dims((t != 0).astype(np.float32), axis=-1)
+    
+    # ===== 概念 2：完全确定性（Deterministic）vs 随机性（Stochastic） =====
+    # 
+    # DDIM 采样公式：x_{t-1} = mean_pred + sigma * noise
+    # 
+    # 当 eta=0 时，sigma=0，所以：
+    #   x_{t-1} = mean_pred + 0 * noise = mean_pred（没有随机项）
+    # 
+    # "完全确定性"的含义：
+    #   - 确定性 = 如果输入相同，输出也完全相同（就像数学函数 f(x) = 2x，输入 3 总是得到 6）
+    #   - 随机性 = 即使输入相同，每次输出可能不同（就像掷骰子，每次结果可能不同）
+    # 
+    # 具体例子：
+    #   - DDPM（随机性）：x_{t-1} = μ + σ·ε，其中 ε 是随机噪声
+    #     输入 x_100 = [1.0, 2.0]，t=100
+    #     第一次采样：x_99 = [0.95, 1.98]（因为 ε 是随机的）
+    #     第二次采样：x_99 = [0.97, 1.99]（因为 ε 不同，结果也不同）
+    #   
+    #   - DDIM（eta=0，完全确定性）：x_{t-1} = mean_pred（没有随机项）
+    #     输入 x_100 = [1.0, 2.0]，t=100
+    #     第一次采样：x_99 = [0.96, 1.98]
+    #     第二次采样：x_99 = [0.96, 1.98]（完全相同，因为公式里没有随机项）
+    # 
+    # 为什么确定性重要？
+    #   - 确定性意味着：从同一个 x_T 开始，去噪路径是唯一确定的
+    #   - 就像"如果我知道起点和路线，我就能准确预测终点"
+    #   - 这允许"跳步"：不需要每步都走，可以跳过中间步骤
+    # 
+    # ===== 概念 3：可以跳步（Subsampling） =====
+    # 
+    # 核心理解：DDIM 通过确定性，增大了步长（可以跳步）
+    # 
+    # "跳步"的含义：
+    #   - 完整采样：x_T → x_{T-1} → x_{T-2} → ... → x_1 → x_0（需要 T 步，例如 T=1000）
+    #   - 跳步采样：x_T → x_{T-10} → x_{T-20} → ... → x_0（只需要 T/10 步，例如 100 步）
+    #   - 跳步就是"跳过中间步骤，直接跳到更远的步骤"，相当于"增大步长"（从 1 步变成 10 步）
+    # 
+    # 为什么 DDPM 不能跳步？
+    #   - DDPM 每步都加随机噪声，路径是随机的
+    #   - 就像"走迷宫时每一步都随机选择方向"
+    #   - 如果跳过中间步骤，无法知道"如果按完整路径走，x_{t-10} 应该是什么"
+    #   - 因为每一步的随机噪声都不同，路径不可预测
+    #   - 必须一步步来：x_100 → x_99 → x_98 → ... → x_90（不能跳过）
+    # 
+    # 为什么 DDIM（eta=0）可以跳步？
+    #   - DDIM 是确定性的：从 x_T 到 x_0 的路径是唯一确定的
+    #   - 就像"走迷宫时每一步都按固定路线走"
+    #   - 即使跳过中间步骤，也可以直接计算：x_{t-10} = f(x_t, t, t-10)
+    #   - 因为路径是确定的，所以可以从任意时间步 t 直接跳到任意时间步 s（s < t）
+    #   - 可以跳步：x_100 → x_90（直接跳过 x_99, x_98, ..., x_91）
+    # 
+    # 跳步的好处：
+    #   - 更快：1000 步变成 100 步（快 10 倍）
+    #   - 但可能精度略低：因为跳过了中间步骤，可能不如完整步骤精确
+    # 
+    # 跳步的实现（在 ddim_sample_loop 中）：
+    #   完整步骤：indices = [999, 998, 997, ..., 1, 0]（1000 步）
+    #   跳步（每 10 步）：indices = [990, 980, 970, ..., 10, 0]（100 步）
+    #   代码：indices = list(range(0, self.num_timesteps, 10))[::-1]
     sample = mean_pred + nonzero_mask * sigma * noise
     return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -618,23 +982,69 @@ class GaussianDiffusion:
     eta=0.0,
   ):
     """
-    Generate samples from the model using DDIM.
-
-    Same usage as p_sample_loop().
+    DDIM 采样循环：从噪声 x_T 逐步去噪到 x_0（动作）。
+    
+    与 p_sample_loop（DDPM）的区别：
+    - DDPM：每步都加随机噪声，完整 T 步去噪
+    - DDIM：确定性采样（eta=0 时），可以跳步，更快
+    
+    流程：
+    1. 从纯噪声开始：x_T ~ N(0,I)
+    2. 循环 T 步（从 T-1 到 0）：
+       - 网络预测噪声：ε_pred = model_forward(x_t, t)
+       - 用 ddim_sample 采样 x_{t-1}（DDIM 公式，与 DDPM 不同）
+    3. 返回最终的动作 x_0
+    
+    :param rng_key: JAX 随机数生成器密钥
+    :param model_forward: 噪声预测网络的函数，输入 (x_t, t)，输出预测的噪声 ε
+                         在 DiffusionPolicy 中，这是 partial(self.base_net, observations)
+    :param shape: 输出数组的形状，例如 [batch_size, action_dim]
+    :param clip_denoised: 无需了解：是否裁剪 pred_xstart（默认即可）
+    :param cond_fn: 无需了解：条件生成函数（本项目不使用）
+    :param model_kwargs: 无需了解：额外的模型参数（本项目不使用）
+    :param eta: 无需了解：DDIM 的随机性参数（eta=0 时完全确定性，默认即可）
+    :return: 生成的动作 x_0，形状与 shape 相同
+    
+    调用位置：在 nets.py 的 DiffusionPolicy.ddim_sample 中被调用（第 213 行）
+    用途：生成时用 DDIM 方式从噪声逐步去噪得到动作（比 DDPM 快，可以跳步）
     """
+    # ===== 第一步：从纯噪声开始 =====
     rng_key, sample_key = jax.random.split(rng_key)
-    x = jax.random.normal(sample_key, shape)
+    x = jax.random.normal(sample_key, shape)  # x_T ~ N(0,I)
 
+    # ===== 第二步：循环 T 步去噪（DDIM 方式） =====
+    # 注意：循环结构看起来和 p_sample_loop 一样，但核心区别在于每步调用的采样函数不同：
+    # - p_sample_loop 调用 p_sample（第 748 行）：x_{t-1} = μ + σ·ε（随机采样，必须完整 T 步）
+    # - ddim_sample_loop 调用 ddim_sample（第 911 行）：x_{t-1} = mean_pred + sigma*noise（当 eta=0 时确定性，可以跳步）
+    # 
+    # 虽然这里循环还是完整的 T 步，但 ddim_sample 内部使用的是 DDIM 的确定性公式（第 817-825 行），
+    # 与 p_sample 的随机采样公式（第 684-685 行）完全不同。
+    # 
+    # 如果要实现跳步加速，可以修改 indices，例如：indices = list(range(0, self.num_timesteps, 10))[::-1]
+    # 这样每 10 步采样一次，更快但可能精度略低。
     indices = list(range(self.num_timesteps))[::-1]
     for i in indices:
+      # 当前时间步 t = i
       t = np.ones(shape[:-1], dtype=np.int32) * i
+      
+      # 网络预测噪声：ε_pred = model_forward(x_t, t)
       model_ouput = model_forward(x, self._scale_timesteps(t))
+      
+      # 用 DDIM 方式采样 x_{t-1}（与 DDPM 的 p_sample 不同）
+      # ddim_sample 的详细实现在第 759 行，使用 DDIM 的确定性公式（第 817-825 行）
+      # 核心区别：DDIM 的采样公式是 mean_pred + sigma*noise，当 eta=0 时 sigma=0（完全确定性）
+      # 而 p_sample 的采样公式是 μ + σ·ε，每步都有随机性
       rng_key, sample_key = jax.random.split(rng_key)
       out = self.ddim_sample(
         sample_key, model_ouput, x, t, clip_denoised, cond_fn, model_kwargs,
         eta
       )
+      
+      # 更新 x：x = x_{t-1}，为下一步做准备
       x = out["sample"]
+    
+    # ===== 第三步：返回最终动作 =====
+    # 循环结束后，x 就是 x_0（去噪完成，得到动作）
     return x
 
   def _vb_terms_bpd(self, model_ouput, x_start, x_t, t, clip_denoised=True):
@@ -670,62 +1080,129 @@ class GaussianDiffusion:
 
   def training_losses(self, rng_key, model_forward, x_start, t):
     """
-    Compute training losses for a single timestep.
-
-    :param model: the model to evaluate loss on.
-    :param x_start: the [N x C x ...] tensor of inputs.
-    :param t: a batch of timestep indices.
-    :param model_kwargs: if not None, a dict of extra keyword arguments to
-        pass to the model. This can be used for conditioning.
-    :return: a dict with the key "loss" containing a tensor of shape [N].
-             Some mean or variance settings may also have other keys.
+    计算扩散模型的训练损失（ELBO → MSE）。
+    
+    这是扩散模型训练的核心函数，实现了 DDPM 的训练目标：
+    - 前向加噪：对真实数据 x_0 加噪得到 x_t
+    - 网络预测：让网络预测噪声（或 x_0，或 x_{t-1}）
+    - 计算损失：MSE loss（网络预测 vs 真实目标）
+    
+    数学原理：
+    - ELBO（Evidence Lower Bound）可以简化为 MSE loss
+    - 当 model_mean_type = EPSILON 时，target = noise，loss = ||noise - model_output||²
+    - 当 model_mean_type = START_X 时，target = x_0，loss = ||x_0 - model_output||²
+    - 当 model_mean_type = PREVIOUS_X 时，target = x_{t-1}，loss = ||x_{t-1} - model_output||²
+    
+    :param rng_key: JAX 随机数生成器密钥
+    :param model_forward: 网络前向传播函数，输入 (x_t, t)，输出预测值
+    :param x_start: 干净输入 x_0，形状 [N x C x ...]（N 是 batch size，C 是特征维度）
+                     在扩散策略中，x_0 是真实动作（来自数据集）
+    :param t: 时间步索引数组，形状 [N]，每个元素表示对应样本的时间步（0 表示第 1 步）
+    :return: 返回一个结果集合（Python字典类型），包含以下内容：
+             - 'loss': 训练损失，形状 [N]（每个样本一个损失值）
+             - 'model_output': 网络输出
+             - 'x_t': 加噪后的数据 x_t
+             - 'ts_weights': 时间步权重（用于加权损失）
+             - 'mse': MSE 损失（如果使用 MSE loss）
+             - 'vb': 变分下界项（如果学习方差）
+             
+             说明：字典（dict）是 Python 的一种数据结构，可以存储多个"名字-值"对
+             例如：terms = {"loss": 0.5, "mse": 0.3} 表示 loss=0.5, mse=0.3
+             可以通过 terms["loss"] 访问 loss 的值
+    
+    调用位置：在 nets.py 的 DiffusionPolicy.loss 中被调用（第 210 行）
+    用途：训练扩散策略网络，让网络学会预测噪声（或 x_0）
     """
+    # ===== 第一步：前向加噪 =====
+    # JAX 说明：JAX 是 Google 开发的科学计算库，类似于 NumPy，但支持：
+    # - 自动微分（用于神经网络训练）
+    # - GPU/TPU 加速（比 NumPy 快很多）
+    # - 函数式编程（更适合并行计算）
+    # 在这个项目中，jax.random.normal 用于生成随机数（类似 numpy.random.normal）
+    # 采样标准高斯噪声 ε ~ N(0,I)
     noise = jax.random.normal(rng_key, x_start.shape, dtype=x_start.dtype)
+    # 对真实数据 x_0 加噪得到 x_t：x_t = √ᾱ_t·x_0 + √(1-ᾱ_t)·ε
     x_t = self.q_sample(x_start, t, noise=noise)
+    
+    # ===== 第二步：网络预测 =====
+    # 网络输入：加噪后的数据 x_t 和时间步 t
+    # 网络输出：根据 model_mean_type 预测噪声 ε（或 x_0，或 x_{t-1}）
     model_output = model_forward(x_t, self._scale_timesteps(t))
 
+    # ===== 第三步：准备返回的结果集合（Python字典类型） =====
+    # 字典（dict）：Python中的一种数据结构，可以存储多个"键-值"对
+    # 例如：{"name": "张三", "age": 20} 表示 name=张三, age=20
+    # 这里 terms 用来存储训练过程中需要的各种中间结果和最终损失
+    # 可以理解为：一个"容器"，里面装了多个"变量"，每个变量都有一个"名字"（键）
     terms = {"model_output": model_output, "x_t": x_t}
+    # 提取时间步权重：用于加权不同时间步的损失（让不同时间步的 loss 贡献更合理）
+    # terms["ts_weights"] 表示在 terms 这个"容器"中添加一个名为 "ts_weights" 的变量
     terms["ts_weights"] = _extract_into_tensor(
       self.normalized_ts_weights, t, x_start.shape[:-1]
     )
 
+    # ===== 第四步：根据 loss_type 计算损失 =====
     if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+      # KL 散度损失：使用完整的变分下界（ELBO）
+      # 本项目不使用此选项，使用 MSE loss
       terms["loss"] = self._vb_terms_bpd(
         model_output, x_start=x_start, x_t=x_t, t=t, clip_denoised=False
       )["output"]
       if self.loss_type == LossType.RESCALED_KL:
         terms["loss"] *= self.num_timesteps
     elif self.loss_type in (LossType.MSE, LossType.RESCALED_MSE):
+      # MSE 损失：ELBO 的简化形式（本项目默认使用此选项）
+      
+      # ===== 4.1：如果学习方差，需要额外计算变分下界项 =====
       if self.model_var_type in (
         ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE
       ):
+        # 学习方差：网络同时输出均值和方差
+        # 此时 model_output 的形状是 [B, C*2, ...]，前一半是均值，后一半是方差
         B, C = x_t.shape[:2]
         assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+        # 拆分：前一半是均值预测，后一半是方差预测
         model_output, model_var_values = np.split(model_output, C, axis=1)
-        # Learn the variance using the variational bound, but don't let
-        # it affect our mean prediction.
+        # 冻结均值部分（detach），只让方差部分参与变分下界计算
+        # 这样可以让方差学习不影响均值预测
         frozen_out = np.concatenate(
           [model_output.detach(), model_var_values], axis=1
         )
+        # 计算变分下界项（用于学习方差）
         terms["vb"] = self._vb_terms_bpd(
           frozen_out, x_start=x_start, x_t=x_t, t=t, clip_denoised=False
         )["output"]
         if self.loss_type == LossType.RESCALED_MSE:
-          # Divide by 1000 for equivalence with initial implementation.
-          # Without a factor of 1/1000, the VB term hurts the MSE term.
+          # 缩放变分下界项：除以 1000 以平衡 MSE 项和 VB 项
+          # 如果不缩放，VB 项会干扰 MSE 项的学习
           terms["vb"] *= self.num_timesteps / 1000.0
+      # 注意：本项目使用固定方差（FIXED_SMALL），所以不会进入这个分支
 
+      # ===== 4.2：根据 model_mean_type 选择目标值 =====
+      # 网络预测的目标取决于 model_mean_type：
       target = {
         ModelMeanType.PREVIOUS_X:
+          # 网络预测 x_{t-1}，目标是从后验分布得到的真实 x_{t-1}
           self.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[0],
         ModelMeanType.START_X:
+          # 网络预测 x_0，目标是真实的 x_0
           x_start,
         ModelMeanType.EPSILON:
+          # 网络预测噪声 ε（本项目默认），目标是真实的噪声
           noise,
       }[self.model_mean_type]
+      
+      # 确保形状一致
       assert model_output.shape == target.shape == x_start.shape
+      
+      # ===== 4.3：计算 MSE 损失 =====
+      # mean_flat：计算除了 batch 维度之外所有维度的平均值
+      # 结果形状：[N]，每个样本一个损失值
       terms["mse"] = mean_flat((target - model_output)**2)
-      # terms["mse"] = (target - model_output)**2
+      
+      # ===== 4.4：组合最终损失 =====
+      # 如果学习方差，损失 = MSE + VB（变分下界项）
+      # 如果固定方差（本项目），损失 = MSE
       if "vb" in terms:
         terms["loss"] = terms["mse"] + terms["vb"]
       else:

@@ -153,3 +153,15 @@ temp/
 *pdf
 
 .trunk/
+
+# Bazel (local build symlinks / outputs)
+bazel-*/
+bazel-out/
+
+# Thesis / local runs (regenerated on AutoDL)
+outputs_portfolio/
+outputs_smoke/
+
+# Windows
+Thumbs.db
+Desktop.ini

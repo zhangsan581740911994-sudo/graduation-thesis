@@ -57,6 +57,10 @@ By default we use `ddpm` solver. To use `dpm`, set `--sample_method=dpm` and `-a
 This codebase can also log to [W&B online visualization platform](https://wandb.ai/site). To log to W&B, you first need to set your W&B API key environment variable.
 Alternatively, you could simply run `wandb login`.
 
+## 复试 / 复现梳理
+
+面试或复现前可参考：[**EDP 复试梳理与演讲稿**](docs/EDP_复试梳理与演讲稿.md)，包含理论、代码架构、完整流程、3–5 分钟演讲稿与常见面试题。
+
 ## Credits
 The project structure borrows from the [Jax CQL implementation](https://github.com/young-geng/JaxCQL).
 
