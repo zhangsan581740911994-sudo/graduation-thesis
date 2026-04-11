@@ -5,7 +5,39 @@
 
 ---
 
-## 0) 当前已达成成就（给新助手的上下文）
+## 0. 新环境恢复指南 (AutoDL 换机必读)
+
+如果你租用了一台全新的 AutoDL 机器，请在开始后续实验前，严格按照以下步骤恢复环境：
+
+### 第一步：拉取完整的代码和数据集
+在新机子的终端里运行：
+```bash
+cd /root/autodl-tmp
+git clone https://github.com/zhangsan581740911994-sudo/graduation-thesis.git
+cd graduation-thesis
+```
+
+### 第二步：恢复模型权重
+1. 将本地备份的 `model_weights_backup.zip` 上传到新机子的 `graduation-thesis` 目录下。
+2. 在终端运行解压命令：
+```bash
+unzip model_weights_backup.zip
+rm model_weights_backup.zip  # 解压确认无误后可删除压缩包省空间
+```
+
+### 第三步：重新配置 Python 虚拟环境
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements-thesis.txt
+```
+
+### 第四步：召唤 AI 助手
+环境准备好后，在 Cursor 里新建一个对话框（Chat），把本文档底部的 **“给新助手的启动指令”** 发给 AI。
+
+---
+
+## 1) 当前已达成成就（给新助手的上下文）
 
 - **牛市进攻达成**：在 179 天强反弹窗口，EDP (O2O) 取得 30.3% 均值收益，超过 25% 目标。
 - **熊市防守达成**：在 96 天单边下跌窗口，大盘亏损，EDP (O2O) 取得 5.03% 均值正收益，防守反击成功。
