@@ -22,6 +22,15 @@ class MixedPortfolioBehaviorPolicy:
         reversion_scale: float = 25.0,
         mixture_mode: Literal["sample", "blend"] = "sample",
     ) -> None:
+        import os
+        noise_level = os.environ.get("PORTFOLIO_NOISE_LEVEL")
+        if noise_level is not None:
+            nl = float(noise_level)
+            # 重新分配概率，让 random (第4项) 占 nl，其余平分剩下的 (1-nl)
+            rem = (1.0 - nl) / 3.0
+            rule_probs = (rem, rem, rem, nl)
+            print(f"[Behavior Policy] 开启高噪声模式！Noise Level = {nl}, 行为策略概率调整为: {rule_probs}")
+
         self.returns = np.asarray(returns, dtype=np.float32)
         if self.returns.ndim != 2:
             raise ValueError("returns must be (T, N).")
