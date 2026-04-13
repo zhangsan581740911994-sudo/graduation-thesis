@@ -41,7 +41,7 @@ for s in 42; do
     --algo_cfg.lr=4e-5 \
     --algo_cfg.diff_coef=0.0 \
     --save_model=false \
-    --logging.output_dir="$RUN_DIR" > "$RUN_DIR.log" 2>&1
+    --logging.output_dir="$RUN_DIR" | tee "$RUN_DIR.log"
   echo "纯 TD3 (seed=$s) 运行完成。日志：$RUN_DIR.log"
 done
 
@@ -64,7 +64,7 @@ for s in 42; do
     --algo_cfg.loss_type=TD3 \
     --algo_cfg.lr=4e-5 \
     --save_model=false \
-    --logging.output_dir="$RUN_DIR" > "$RUN_DIR.log" 2>&1
+    --logging.output_dir="$RUN_DIR" | tee "$RUN_DIR.log"
   echo "EDP (seed=$s) 运行完成。日志：$RUN_DIR.log"
 done
 
