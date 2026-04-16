@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import glob
 
 import jax
 import matplotlib.pyplot as plt
@@ -34,9 +35,38 @@ plt.rcParams['figure.dpi'] = 300
 plt.rcParams['savefig.dpi'] = 300
 
 
+def resolve_model_dir(model_dir_or_glob: str) -> Path:
+    """支持传具体目录或通配符；自动定位包含 variant.json 的真实 run 目录。"""
+    p = Path(model_dir_or_glob)
+    if p.exists():
+        if (p / "variant.json").exists():
+            return p
+        candidates = sorted(
+            [x for x in p.glob("**/*") if x.is_dir() and (x / "variant.json").exists()],
+            key=lambda x: x.stat().st_mtime,
+        )
+        if candidates:
+            return candidates[-1]
+
+    # 当传入的是通配符（推荐在 AutoDL 上使用）
+    matches = sorted(glob.glob(model_dir_or_glob))
+    candidates = []
+    for m in matches:
+        mp = Path(m)
+        if mp.is_dir() and (mp / "variant.json").exists():
+            candidates.append(mp)
+        elif mp.is_dir():
+            sub = [x for x in mp.glob("**/*") if x.is_dir() and (x / "variant.json").exists()]
+            candidates.extend(sub)
+    candidates = sorted(set(candidates), key=lambda x: x.stat().st_mtime)
+    if not candidates:
+        raise FileNotFoundError(f"找不到可用模型目录（未发现 variant.json）: {model_dir_or_glob}")
+    return candidates[-1]
+
+
 def load_model(model_dir):
     """从指定目录加载训练好的 EDP 模型"""
-    model_dir = Path(model_dir)
+    model_dir = resolve_model_dir(model_dir)
     variant_path = model_dir / "variant.json"
     
     if not variant_path.exists():
@@ -63,6 +93,7 @@ def load_model(model_dir):
             return -1
             
     latest_pkl = max(pkl_files, key=get_epoch)
+    print(f"模型目录: {model_dir}")
     print(f"正在加载模型: {latest_pkl}")
     
     # 重新构建模型架构
@@ -99,6 +130,42 @@ def calculate_drawdown(nav_array):
     return drawdown
 
 
+def load_dates_returns_and_tickers(csv_path: str):
+    """按日期-股票对齐，返回 dates / returns(T,N) / tickers。"""
+    df = pd.read_csv(csv_path)
+    if {"date", "symbol", "return"}.issubset(df.columns):
+        work = df[["date", "symbol", "return"]].copy()
+        work["date"] = pd.to_datetime(work["date"])
+        work["symbol"] = work["symbol"].astype(str).str.zfill(6)
+        panel = work.pivot_table(index="date", columns="symbol", values="return", aggfunc="last").sort_index()
+        panel = panel.dropna(axis=0, how="any")
+        return panel.index.to_list(), panel.to_numpy(dtype=np.float32), panel.columns.astype(str).to_list()
+
+    # 宽表兜底
+    df["date"] = pd.to_datetime(df["date"])
+    cols = [c for c in df.columns if c != "date"]
+    tmp = df[["date"] + cols].dropna(axis=0, how="any")
+    return tmp["date"].to_list(), tmp[cols].to_numpy(dtype=np.float32), cols
+
+
+def build_baseline_weights(tickers):
+    """构造 Buy&Hold（官方权重）与 EqualWeight 权重。"""
+    ew = np.ones(len(tickers), dtype=np.float32) / len(tickers)
+    w_path = Path("data_thesis/top20_hs300_by_official_weight.csv")
+    if not w_path.exists():
+        return ew, ew
+    wdf = pd.read_csv(w_path)
+    if not {"symbol", "weight"}.issubset(wdf.columns):
+        return ew, ew
+    wdf["symbol"] = wdf["symbol"].astype(str).str.zfill(6)
+    wm = {r["symbol"]: float(r["weight"]) for _, r in wdf.iterrows()}
+    bh = np.array([wm.get(str(t), 0.0) for t in tickers], dtype=np.float32)
+    if bh.sum() <= 0:
+        return ew, ew
+    bh = bh / bh.sum()
+    return bh, ew
+
+
 def run_backtest(model, test_csv, sample_method="ddpm"):
     """在测试集上运行回测，收集每天的收益"""
     print(f"正在测试集上运行回测: {test_csv}")
@@ -111,8 +178,8 @@ def run_backtest(model, test_csv, sample_method="ddpm"):
     ew_returns = []
     dates = []
     
-    # 获取日期列表用于画图 (跳过第一天，因为第一天是初始状态)
-    returns_matrix, date_list = load_returns_panel_csv(test_csv)
+    dates_all, returns_matrix, tickers = load_dates_returns_and_tickers(test_csv)
+    bh_w, ew_w = build_baseline_weights(tickers)
     
     # 确保使用正确的随机数种子
     rng = jax.random.PRNGKey(42)
@@ -120,7 +187,7 @@ def run_backtest(model, test_csv, sample_method="ddpm"):
     step = 0
     while not done:
         # 获取 EDP 动作
-        obs_jax = batch_to_jax(np.expand_params(obs, axis=0))
+        obs_jax = batch_to_jax(np.expand_dims(obs, axis=0))
         rng, act_rng = jax.random.split(rng)
         
         # 使用扩散模型采样动作
@@ -132,14 +199,22 @@ def run_backtest(model, test_csv, sample_method="ddpm"):
         
         # 记录收益 (注意：环境返回的 reward 可能是 norm 过的，我们需要真实的 portfolio return)
         # 真实收益 = 动作权重 * 当天真实收益率
-        actual_return = info.get('portfolio_return', reward)
+        actual_return = float(reward)
+        day_idx = step
+        if day_idx < len(returns_matrix):
+            day_ret = returns_matrix[day_idx]
+            bh_r = float(np.dot(bh_w, day_ret))
+            ew_r = float(np.dot(ew_w, day_ret))
+        else:
+            bh_r = 0.0
+            ew_r = 0.0
         
         edp_returns.append(actual_return)
-        bh_returns.append(info.get('bh_return', 0.0))
-        ew_returns.append(info.get('ew_return', 0.0))
+        bh_returns.append(bh_r)
+        ew_returns.append(ew_r)
         
-        if step < len(date_list):
-            dates.append(date_list[step])
+        if step < len(dates_all):
+            dates.append(dates_all[step])
             
         obs = next_obs
         step += 1
@@ -233,7 +308,7 @@ def plot_drawdown(results, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="生成论文图表：累计净值与回撤")
-    parser.add_argument("--model_dir", type=str, required=True, help="包含 variant.json 和 model_*.pkl 的目录")
+    parser.add_argument("--model_dir", type=str, required=True, help="模型目录或通配符（自动定位含 variant.json 的目录）")
     parser.add_argument("--test_csv", type=str, required=True, help="用于回测的测试集 CSV 路径")
     parser.add_argument("--output_prefix", type=str, default="backtest", help="输出图片文件名的前缀")
     

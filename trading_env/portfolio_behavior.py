@@ -1,10 +1,20 @@
 """
 多标的行为策略：与单标 MixedBehaviorPolicy 同类规则，但在每个标的上生成分量，
 再按 sample/blend 混合，输出 N 维 logits（与环境 softmax 一致）。
+
+环境变量（可选）：
+- PORTFOLIO_BEHAVIOR_MODE=multimodal
+  构造「低覆盖 + 多峰」离线数据：多数步为窄扰动（接近等权），少数步为尖峰集中仓位，
+  用于消融中放大 TD3（单峰倾向）与 EDP（多模态生成）的差异。
+  可选：PORTFOLIO_MULTIMODAL_CONSERVATIVE_FRAC（默认 0.7）、
+        PORTFOLIO_MULTIMODAL_CONSERVATIVE_STD（默认 0.12）、
+        PORTFOLIO_MULTIMODAL_EXTREME_K_MAX（默认 3）。
+  设置 multimodal 时不再使用 PORTFOLIO_NOISE_LEVEL 的四规则混合。
 """
 
 from __future__ import annotations
 
+import os
 from typing import Literal, Tuple
 
 import numpy as np
@@ -22,19 +32,46 @@ class MixedPortfolioBehaviorPolicy:
         reversion_scale: float = 25.0,
         mixture_mode: Literal["sample", "blend"] = "sample",
     ) -> None:
-        import os
-        noise_level = os.environ.get("PORTFOLIO_NOISE_LEVEL")
-        if noise_level is not None:
-            nl = float(noise_level)
-            # 重新分配概率，让 random (第4项) 占 nl，其余平分剩下的 (1-nl)
-            rem = (1.0 - nl) / 3.0
-            rule_probs = (rem, rem, rem, nl)
-            print(f"[Behavior Policy] 开启高噪声模式！Noise Level = {nl}, 行为策略概率调整为: {rule_probs}")
-
         self.returns = np.asarray(returns, dtype=np.float32)
         if self.returns.ndim != 2:
             raise ValueError("returns must be (T, N).")
-        self.n = self.returns.shape[1]
+        self.n = int(self.returns.shape[1])
+        self.rng = np.random.default_rng(seed)
+
+        self._mode = os.environ.get("PORTFOLIO_BEHAVIOR_MODE", "").strip().lower()
+        if self._mode == "multimodal":
+            self._conservative_frac = float(
+                os.environ.get("PORTFOLIO_MULTIMODAL_CONSERVATIVE_FRAC", "0.7")
+            )
+            self._conservative_std = float(
+                os.environ.get("PORTFOLIO_MULTIMODAL_CONSERVATIVE_STD", "0.12")
+            )
+            self._extreme_k_max = int(
+                os.environ.get("PORTFOLIO_MULTIMODAL_EXTREME_K_MAX", "3")
+            )
+            self._extreme_k_max = max(1, min(self._extreme_k_max, self.n))
+            print(
+                "[Behavior Policy] multimodal："
+                f"conservative_frac={self._conservative_frac}, "
+                f"conservative_std={self._conservative_std}, "
+                f"extreme_k_max={self._extreme_k_max}"
+            )
+            self.momentum_scale = float(momentum_scale)
+            self.reversion_scale = float(reversion_scale)
+            self.mixture_mode = mixture_mode
+            self._p = (1.0, 0.0, 0.0, 0.0)
+            return
+
+        noise_level = os.environ.get("PORTFOLIO_NOISE_LEVEL")
+        if noise_level is not None:
+            nl = float(noise_level)
+            rem = (1.0 - nl) / 3.0
+            rule_probs = (rem, rem, rem, nl)
+            print(
+                f"[Behavior Policy] 开启高噪声模式！Noise Level = {nl}, "
+                f"行为策略概率调整为: {rule_probs}"
+            )
+
         if len(rule_probs) != 4:
             raise ValueError("rule_probs must have length 4.")
         s = float(sum(rule_probs))
@@ -42,7 +79,6 @@ class MixedPortfolioBehaviorPolicy:
         self.momentum_scale = float(momentum_scale)
         self.reversion_scale = float(reversion_scale)
         self.mixture_mode = mixture_mode
-        self.rng = np.random.default_rng(seed)
 
     def _prev_returns(self, t: int) -> np.ndarray:
         if t <= 0:
@@ -62,7 +98,21 @@ class MixedPortfolioBehaviorPolicy:
     def _rule_random(self) -> np.ndarray:
         return self.rng.uniform(-1.0, 1.0, size=self.n).astype(np.float32)
 
+    def _act_multimodal(self, t: int) -> np.ndarray:
+        """70% 窄 logits（接近等权）；30% 随机 k 标的尖峰重仓（多峰）。"""
+        if self.rng.random() < self._conservative_frac:
+            x = self.rng.normal(0.0, self._conservative_std, size=self.n)
+            return np.clip(x, -1.0, 1.0).astype(np.float32)
+        k_hi = int(self.rng.integers(1, self._extreme_k_max + 1))
+        logits = np.full(self.n, -1.0, dtype=np.float32)
+        idx = self.rng.choice(self.n, size=k_hi, replace=False)
+        logits[idx] = 1.0
+        return np.clip(logits, -1.0, 1.0).astype(np.float32)
+
     def act(self, t: int) -> np.ndarray:
+        if self._mode == "multimodal":
+            return self._act_multimodal(t)
+
         prev_r = self._prev_returns(t)
         a_m = self._rule_momentum(prev_r)
         a_r = self._rule_mean_reversion(prev_r)
