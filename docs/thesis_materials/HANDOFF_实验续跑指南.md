@@ -38,7 +38,8 @@ pip install -r requirements-thesis.txt
 cd /root/autodl-tmp/graduation-thesis
 git pull
 source venv/bin/activate
-pip install -r requirements-thesis.txt
+pip install -r requirements-csi1000-data.txt
+# 训练环境未装时再：pip install -r requirements-thesis.txt
 ```
 
 ### 第四步：召唤 AI 助手
