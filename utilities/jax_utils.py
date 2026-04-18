@@ -21,27 +21,30 @@ import jax.numpy as jnp
 class JaxRNG(object):
 
   def __init__(self, seed):
-    # 在部分 AutoDL 显卡（如 Ada sm_89）上，默认在 GPU 上创建 PRNGKey 会触发针对
-    # sm_90a 等的 PTX 编译，与本机 GPU 架构不一致导致 ptxas 报错。先在 CPU 上生成 key，
-    # 再拷贝到 GPU（仅 memcpy，不再走错误架构的 kernel 编译）。
-    # JAX 0.4.x：local_devices 首参是 process_index(int)，不能传 "cpu"。用 devices(backend)。
+    # Ada(sm_89) 等卡上 GPU 侧 PRNGKey / split 会误编 sm_90a PTX。状态始终在 CPU。
     cpu_devices = list(jax.devices("cpu"))
-    gpu_devices = list(jax.devices("gpu"))
     if cpu_devices:
       try:
         with jax.default_device(cpu_devices[0]):
-          rng = jax.random.PRNGKey(seed)
+          k = jax.random.PRNGKey(seed)
+        self.rng = jax.device_put(k, cpu_devices[0])
       except Exception:
-        rng = jax.random.PRNGKey(seed)
+        self.rng = jax.random.PRNGKey(seed)
     else:
-      rng = jax.random.PRNGKey(seed)
-    if gpu_devices:
-      self.rng = jax.device_put(rng, gpu_devices[0])
-    else:
-      self.rng = rng
+      self.rng = jax.random.PRNGKey(seed)
 
   def __call__(self):
-    self.rng, next_rng = jax.random.split(self.rng)
+    cpu_devices = list(jax.devices("cpu"))
+    gpu_devices = list(jax.devices("gpu"))
+    if not cpu_devices:
+      self.rng, next_rng = jax.random.split(self.rng)
+      return jax.device_put(next_rng, gpu_devices[0]) if gpu_devices else next_rng
+    # 先 materialize 到 CPU，再 split；仅 default_device 仍可能在 GPU 上编 threefry。
+    k = jax.device_put(self.rng, cpu_devices[0])
+    with jax.default_device(cpu_devices[0]):
+      self.rng, next_rng = jax.random.split(k)
+    if gpu_devices:
+      return jax.device_put(next_rng, gpu_devices[0])
     return next_rng
 
 
