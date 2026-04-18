@@ -1,7 +1,7 @@
 # HANDOFF：论文收尾与图表生成指南（后续专用）
 
 > 用途：核心实验（牛市/熊市/消融）已全部跑通！本阶段目标是**“画图表 + 补深度消融”**，直接产出能插入毕业论文的高清图片和深度分析。  
-> 更新时间：2026-04-18
+> 更新时间：2026-04-18（已追加 §1.5 AutoDL/CSI1000 续接备忘）
 
 ---
 
@@ -116,7 +116,47 @@ pip install -r requirements-csi1000-data.txt
 
 **逐步命令与脚本说明**：见 `docs/thesis_materials/CSI1000_Top50实验步骤.md`（含 **`git pull`、环境、数据下载、预处理、`run_ablation_multimodal_csi1000.sh`**）。
 
-在 AutoDL 上跑 CSI1000 流程前，务必在项目根目录先 **`git pull`**，再 `source venv/bin/activate` 与 `pip install -r requirements-thesis.txt`（或 `pip install baostock`），避免用的还是旧下载脚本。
+在 AutoDL 上跑 CSI1000 流程前，务必在项目根目录先 **`git pull`**，再 `source venv/bin/activate` 与 `pip install -r requirements-csi1000-data.txt`（或至少 `pip install baostock`），避免用的还是旧下载脚本。
+
+---
+
+## 1.5) 续接备忘：AutoDL × CSI1000 multimodal 消融（截至 2026-04-18）
+
+> 本节供**新开对话**时粘贴给助手，避免重复解释环境。仓库：`https://github.com/zhangsan581740911994-sudo/graduation-thesis`（`main`）。
+
+### 已完成（可认为已闭环）
+
+- **CSI1000 Top50 数据**：`python data_thesis/get_csi1000_top50_by_weight.py`（**BaoStock** 拉日线，云主机上比 akshare 新浪稳）+ `python data_thesis/preprocess_csi1000_top50_offline_dataset.py` → 产出 `data_thesis/csi1000_top50_offline_{train,val,test,full}.csv`。
+- **依赖**：`requirements-csi1000-data.txt`（pandas/akshare/baostock，避免为下数据反复 `pip install -r requirements-thesis.txt` 升降级 JAX）。
+- **消融入口**：`SEEDS="42 43 44" bash scripts/run_ablation_multimodal_csi1000.sh`（内部 `TRAIN_CSV`/`EVAL_CSV` 指向 CSI1000 CSV）。
+- **JAX GPU（cp312）**：官方 `jax_cuda_releases` 对 **Python 3.12 的一体 GPU jaxlib 只到 `0.4.29+cuda12.cudnn91`**，无 `0.4.35+cuda12`。脚本 `scripts/install_jax_gpu_autodl_cp312.sh`；环境 `scripts/source_autodl_jax_gpu_env.sh`（含 `LD_LIBRARY_PATH` + 可选 `nvidia-cuda-nvcc-cu12` 的 ptxas）；详 `docs/thesis_materials/CSI1000_Top50实验步骤.md`。
+- **扩散 beta 预计算**：`diffusion/diffusion.py` 中 `GaussianDiffusion.__init__` 已改为 **NumPy（`onp`）在 CPU 算完再 `jnp.asarray`**，避免 `linspace`/`cumprod` 等在 GPU 上触发错误 PTX。
+- **随机数**：`utilities/jax_utils.py` 中 `JaxRNG` 已多轮修补：CPU 上建 key、`device_put`、以及 **`jax.jit(jax.random.split, device=cpu)`**（`_get_split_on_cpu_jit`），减轻 **Ada（sm_89）** 上误编 **sm_90a** 的 `ptxas fatal` 问题。
+
+### 当前阻塞 / 风险
+
+1. **`git pull` 间歇失败**（`GnuTLS recv error (-110)`）：AutoDL 到 GitHub TLS 不稳 → **多试**、换网络、或用镜像/本机浏览器打开 GitHub **手动覆盖**关键文件（至少 `utilities/jax_utils.py`、`diffusion/diffusion.py`）。镜像示例见 `CSI1000_Top50实验步骤.md`。
+2. **若 pull 失败仍跑训练**：实例里可能是**旧版** `jax_utils.py`（例如 `__call__` 里仍直接 `jax.random.split(self.rng)`），会继续报 **sm_90a**。
+3. **Jax plugin / `cuda_versions` AssertionError**：日志里常见，若 **`jax.devices()` 已含 `cuda` 且 `default backend` 为 `gpu`**，多数情况可**先忽略**；以能否进入训练循环为准。
+4. **`orbax-export` 与 jax 0.4.29 冲突提示**：一般可 `pip uninstall -y orbax-export`（毕设 portfolio 路径通常不需要）。
+
+### 下一步（新对话请助手优先做）
+
+1. **确认代码版本**：`grep -n _get_split_on_cpu_jit utilities/jax_utils.py` 有命中；`grep -n onp.asarray diffusion/diffusion.py` 在 `GaussianDiffusion.__init__` 附近有命中。若无 → **必须** `git pull` 或手动同步。
+2. **环境**：`source venv/bin/activate` → `source scripts/source_autodl_jax_gpu_env.sh` → `python -c "import jax; print(jax.devices(), jax.default_backend())"`。
+3. **重跑**：`SEEDS="42 43 44" bash scripts/run_ablation_multimodal_csi1000.sh`。
+4. **若仍 `sm_90a`**：在新对话里贴**完整 traceback** + `nvidia-smi` + `python -c "import jax; print(jax.__version__, jax.lib.xla_bridge.get_backend().platform)"`；可选兜底 **`export JAX_PLATFORMS=cpu`** 先验证训练逻辑（极慢）；或评估 **Python 3.11 venv** + 与 Flax 兼容的 **jax/jaxlib CUDA** 组合（需单独调研 wheel）。
+5. **跑通后**：按 `CSI1000_Top50实验步骤.md` 汇总 `outputs_portfolio_ablation_multimodal/*/progress.csv`；论文叙事仍以 HANDOFF 任务 A/B 主线为准，CSI1000 为附录扩展。
+
+### 新开对话时可粘贴（续接专用）
+
+```text
+请阅读 docs/thesis_materials/HANDOFF_实验续跑指南.md 的「§1.5 续接备忘」全文。
+
+背景：AutoDL 上 CSI1000 Top50 数据与预处理已成功；目标是跑通 scripts/run_ablation_multimodal_csi1000.sh（multimodal TD3 vs EDP）。当前卡点为部分 GPU 上 JAX/ptxas 与 sm_90a 相关错误，且 git pull 可能 TLS 失败。
+
+请根据 §1.5 检查我本地/实例上的 utilities/jax_utils.py 与 diffusion/diffusion.py 是否为 main 最新版；若仍报错，根据完整 traceback 给出下一步（含是否必须换 JAX 版本或 CPU 验证）。
+```
 
 ---
 
