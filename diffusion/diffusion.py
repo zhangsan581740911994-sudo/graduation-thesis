@@ -23,7 +23,7 @@ of beta schedules.
 import enum
 import math
 
-# import numpy as np
+import numpy as onp
 import jax
 import jax.numpy as np
 
@@ -56,9 +56,9 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     beta_start = scale * 0.0001
     # 计算 beta 结束值
     beta_end = scale * 0.02
-    # 返回 beta 数组
-    return np.linspace(
-      beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
+    # 返回 beta 数组（用 NumPy 避免在 GPU 上 JIT linspace，部分显卡会误编 sm_90a PTX）
+    return onp.linspace(
+      beta_start, beta_end, num_diffusion_timesteps, dtype=onp.float64
     )
   # 余弦调度
   elif schedule_name == "cosine":
@@ -72,13 +72,13 @@ def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     # 计算 T 参数
     T = num_diffusion_timesteps
     # 计算 t 数组
-    t = np.arange(1, T + 1)
+    t = onp.arange(1, T + 1)
     # 计算 b_max 参数
     b_max = 10.
     # 计算 b_min 参数
     b_min = 0.1
     # 计算 alpha 数组
-    alpha = np.exp(-b_min / T - 0.5 * (b_max - b_min) * (2 * t - 1) / T**2)
+    alpha = onp.exp(-b_min / T - 0.5 * (b_max - b_min) * (2 * t - 1) / T**2)
     # 计算 beta 数组
     betas = 1 - alpha
     return betas
@@ -103,7 +103,7 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     t1 = i / num_diffusion_timesteps
     t2 = (i + 1) / num_diffusion_timesteps
     betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
-  return np.array(betas)
+  return onp.array(betas)
 
 
 class ModelMeanType(enum.Enum):
@@ -180,91 +180,58 @@ class GaussianDiffusion:
     self.min_value = min_value
     self.max_value = max_value
 
-    # Use float64 for accuracy.
-    # 调用函数生成 betas 数组
-    betas = get_named_beta_schedule(schedule_name, num_timesteps)
-    # betas = np.array(betas, dtype=np.float64)
-    # 将 betas 数组转换为 float32 类型
-    betas = np.array(betas, dtype=np.float32)
-
-    # 保存 beta 数组
-    self.betas = betas
-    # 确保 beta 数组是一维数组
+    # 预计算全部在 CPU（NumPy）完成，再转为 JAX 数组；避免在部分 GPU 上误编 sm_90a PTX。
+    betas = onp.asarray(
+      get_named_beta_schedule(schedule_name, num_timesteps), dtype=onp.float32
+    )
     assert len(betas.shape) == 1, "betas must be 1-D"
-    # 确保 beta 数组在 [0, 1] 之间
     assert (betas > 0).all() and (betas <= 1).all()
 
-    # 保存时间步数
     self.num_timesteps = int(betas.shape[0])
 
-    # 计算 alpha 数组：α_t = 1 - β_t，表示第 t 步保留信号的比例
-    # 用途：用于计算累积乘积，是扩散模型的基础系数
     alphas = 1.0 - betas
-    
-    # 计算 alpha 累积积：ᾱ_t = α₁ × α₂ × ... × α_t，从 x₀ 到 x_t 的累积保留比例
-    # 用途：用于前向加噪公式 x_t = √ᾱ_t·x₀ + √(1-ᾱ_t)·ε，以及后向去噪的均值计算
-    self.alphas_cumprod = np.cumprod(alphas, axis=0)
-    
-    # 计算 alpha 累积积的前一个值：ᾱ_{t-1}，前一个时间步的累积保留比例
-    # 结构：[1.0, ᾱ₁, ᾱ₂, ..., ᾱ_{T-1}]，第一个元素是 1.0（t=0 时没有前一步）
-    # 用途：计算后验分布 q(x_{t-1}|x_t, x_0) 的方差和均值系数（posterior_variance、posterior_mean_coef1/coef2），以及 DDIM 采样
-    self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
-    
-    # 计算 alpha 累积积的下一个值：ᾱ_{t+1}，下一个时间步的累积保留比例
-    # 结构：[ᾱ₂, ᾱ₃, ..., ᾱ_T, 0.0]，最后一个元素是 0.0（t=T 时没有下一步）
-    # 用途：DDIM 反向采样（ddim_reverse_sample），从 x_t 采样 x_{t+1} 时需要（加噪方向）
-    # 注意：这不是用于生成加速的去噪过程（去噪用 alphas_cumprod_prev），而是用于反向加噪的特殊场景
-    # 在本项目中 ddim_reverse_sample 可能未被实际使用，但保留此变量以支持完整的 DDIM 功能
-    self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)
-    
-    # 确保 alpha 累积积的前一个值形状正确：长度必须等于 num_timesteps
-    # 用途：防御性检查，确保后续索引操作不会出错
-    assert self.alphas_cumprod_prev.shape == (self.num_timesteps,)
+    alphas_cumprod = onp.cumprod(alphas, axis=0)
+    alphas_cumprod_prev = onp.append(1.0, alphas_cumprod[:-1])
+    alphas_cumprod_next = onp.append(alphas_cumprod[1:], 0.0)
+    assert alphas_cumprod_prev.shape == (self.num_timesteps,)
 
-    # 后续会频繁用到的各种 ᾱ_t 相关系数（预先算好，避免重复开方/取对数）
-    # √ᾱ_t，用于前向加噪均值 x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε 中乘在 x0 前面的系数
-    self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
-    # √(1-ᾱ_t)，用于前向加噪中乘在噪声 ε 前面的系数
-    self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
-    # log(1-ᾱ_t)，用于 NLL / KL 等需要 log-variance 的地方
-    self.log_one_minus_alphas_cumprod = np.log(1.0 - self.alphas_cumprod)
-    # √(1/ᾱ_t)，用于从 (x_t, ε) 或 (x_t, x̂0) 反推 x̂0 时的系数
-    self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
-    # √(1/ᾱ_t - 1) = √((1-ᾱ_t)/ᾱ_t)，用于在 _predict_xstart_from_eps /
-    # _predict_eps_from_xstart 里构造噪声那一项的系数
-    self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
+    sqrt_alphas_cumprod = onp.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = onp.sqrt(1.0 - alphas_cumprod)
+    log_one_minus_alphas_cumprod = onp.log(1.0 - alphas_cumprod)
+    sqrt_recip_alphas_cumprod = onp.sqrt(1.0 / alphas_cumprod)
+    sqrt_recipm1_alphas_cumprod = onp.sqrt(1.0 / alphas_cumprod - 1)
 
-    # calculations for posterior q(x_{t-1} | x_t, x_0)
-    # 后验方差：σ²_post(t) = β_t * (1 - ᾱ_{t-1}) / (1 - ᾱ_t)
-    # 用途：用于计算后验分布 q(x_{t-1}|x_t, x_0) 的方差，训练时作为目标让网络学习
-    self.posterior_variance = (
-      betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+    posterior_variance = (
+      betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
     )
-    # 后验方差的 log 形式（做了 clipping 处理）
-    # 原因：在扩散链开始处（t=0）后验方差可能为 0，直接取 log 会数值不稳定
-    # 处理：把第一个时间步的 log-variance 设为第二个时间步的值，避免 log(0)
-    # 用途：用于 ELBO / NLL 计算中需要 log-variance 的地方
-    self.posterior_log_variance_clipped = np.log(
-      np.append(self.posterior_variance[1], self.posterior_variance[1:])
+    posterior_log_variance_clipped = onp.log(
+      onp.append(posterior_variance[1], posterior_variance[1:])
     )
-    # 后验均值的系数 1：c₁(t) = β_t * √ᾱ_{t-1} / (1 - ᾱ_t)
-    # 用途：计算后验均值 μ_post(x_t, x_0) = c₁(t)·x_0 + c₂(t)·x_t 时乘在 x_0 前面的系数
-    self.posterior_mean_coef1 = (
-      betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+    posterior_mean_coef1 = (
+      betas * onp.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
     )
-    # 后验均值的系数 2：c₂(t) = (1 - ᾱ_{t-1}) * √α_t / (1 - ᾱ_t)
-    # 用途：计算后验均值时乘在 x_t 前面的系数
-    self.posterior_mean_coef2 = (
-      (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) /
-      (1.0 - self.alphas_cumprod)
+    posterior_mean_coef2 = (
+      (1.0 - alphas_cumprod_prev) * onp.sqrt(alphas) /
+      (1.0 - alphas_cumprod)
     )
-    # 时间步权重：w_t = β_t / (2 * (1 - ᾱ_t) * α_t)
-    # 含义：ELBO 展开后，不同时间步 t 的 KL 项对总 loss 的贡献权重（理论推导得出）
-    # 用途：在 training_losses 中用于加权 MSE，让不同时间步的 loss 贡献更合理
-    self.ts_weights = ws = betas / (2 * (1 - self.alphas_cumprod) * alphas)
-    # 归一化后的时间步权重：将权重归一化，使总权重保持稳定
-    # 用途：用于更精细地控制训练时不同时间步的 loss 权重分配
-    self.normalized_ts_weights = ws * num_timesteps / ws.sum()
+    ws = betas / (2 * (1.0 - alphas_cumprod) * alphas)
+    normalized_ts_weights = ws * num_timesteps / ws.sum()
+
+    self.betas = np.asarray(betas)
+    self.alphas_cumprod = np.asarray(alphas_cumprod)
+    self.alphas_cumprod_prev = np.asarray(alphas_cumprod_prev)
+    self.alphas_cumprod_next = np.asarray(alphas_cumprod_next)
+    self.sqrt_alphas_cumprod = np.asarray(sqrt_alphas_cumprod)
+    self.sqrt_one_minus_alphas_cumprod = np.asarray(sqrt_one_minus_alphas_cumprod)
+    self.log_one_minus_alphas_cumprod = np.asarray(log_one_minus_alphas_cumprod)
+    self.sqrt_recip_alphas_cumprod = np.asarray(sqrt_recip_alphas_cumprod)
+    self.sqrt_recipm1_alphas_cumprod = np.asarray(sqrt_recipm1_alphas_cumprod)
+    self.posterior_variance = np.asarray(posterior_variance)
+    self.posterior_log_variance_clipped = np.asarray(posterior_log_variance_clipped)
+    self.posterior_mean_coef1 = np.asarray(posterior_mean_coef1)
+    self.posterior_mean_coef2 = np.asarray(posterior_mean_coef2)
+    self.ts_weights = np.asarray(ws)
+    self.normalized_ts_weights = np.asarray(normalized_ts_weights)
 
   def q_mean_variance(self, x_start, t):
     """
