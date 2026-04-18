@@ -21,7 +21,23 @@ import jax.numpy as jnp
 class JaxRNG(object):
 
   def __init__(self, seed):
-    self.rng = jax.random.PRNGKey(seed)
+    # 在部分 AutoDL 显卡（如 Ada sm_89）上，默认在 GPU 上创建 PRNGKey 会触发针对
+    # sm_90a 等的 PTX 编译，与本机 GPU 架构不一致导致 ptxas 报错。先在 CPU 上生成 key，
+    # 再拷贝到 GPU（仅 memcpy，不再走错误架构的 kernel 编译）。
+    cpu_devices = jax.local_devices("cpu")
+    gpu_devices = jax.local_devices("gpu")
+    if cpu_devices:
+      try:
+        with jax.default_device(cpu_devices[0]):
+          rng = jax.random.PRNGKey(seed)
+      except Exception:
+        rng = jax.random.PRNGKey(seed)
+    else:
+      rng = jax.random.PRNGKey(seed)
+    if gpu_devices:
+      self.rng = jax.device_put(rng, gpu_devices[0])
+    else:
+      self.rng = rng
 
   def __call__(self):
     self.rng, next_rng = jax.random.split(self.rng)
