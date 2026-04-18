@@ -5,6 +5,8 @@
 numpy>=1.22,<3
 pandas>=1.3
 gym>=0.21,<0.26
+# 训练默认可用 CPU jaxlib（PyPI）。AutoDL + Python3.12 + GPU 请用 scripts/install_jax_gpu_autodl_cp312.sh
+# （官方 jax_cuda_releases 对 cp312 的 GPU jaxlib 为 0.4.29+cuda12，无 0.4.35+cuda 一体式轮子）
 jax==0.4.35
 jaxlib==0.4.35
 orbax-checkpoint==0.5.16
