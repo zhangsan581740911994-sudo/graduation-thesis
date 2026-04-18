@@ -6,9 +6,12 @@
 - PORTFOLIO_BEHAVIOR_MODE=multimodal
   构造「低覆盖 + 多峰」离线数据：多数步为窄扰动（接近等权），少数步为尖峰集中仓位，
   用于消融中放大 TD3（单峰倾向）与 EDP（多模态生成）的差异。
-  可选：PORTFOLIO_MULTIMODAL_CONSERVATIVE_FRAC（默认 0.7）、
+  可选：PORTFOLIO_MULTIMODAL_CONSERVATIVE_FRAC（默认 0.2）、
         PORTFOLIO_MULTIMODAL_CONSERVATIVE_STD（默认 0.12）、
-        PORTFOLIO_MULTIMODAL_EXTREME_K_MAX（默认 3）。
+        PORTFOLIO_MULTIMODAL_EXTREME_K_MAX（默认 1）。
+  额外可选：PORTFOLIO_MULTIMODAL_EXTREME_STYLE（默认 rank_bimodal）
+        - rank_bimodal：在同一状态下随机选择「追涨极端峰」或「反转极端峰」
+        - random_spike：随机重仓（旧逻辑）
   设置 multimodal 时不再使用 PORTFOLIO_NOISE_LEVEL 的四规则混合。
 """
 
@@ -41,20 +44,24 @@ class MixedPortfolioBehaviorPolicy:
         self._mode = os.environ.get("PORTFOLIO_BEHAVIOR_MODE", "").strip().lower()
         if self._mode == "multimodal":
             self._conservative_frac = float(
-                os.environ.get("PORTFOLIO_MULTIMODAL_CONSERVATIVE_FRAC", "0.7")
+                os.environ.get("PORTFOLIO_MULTIMODAL_CONSERVATIVE_FRAC", "0.2")
             )
             self._conservative_std = float(
                 os.environ.get("PORTFOLIO_MULTIMODAL_CONSERVATIVE_STD", "0.12")
             )
             self._extreme_k_max = int(
-                os.environ.get("PORTFOLIO_MULTIMODAL_EXTREME_K_MAX", "3")
+                os.environ.get("PORTFOLIO_MULTIMODAL_EXTREME_K_MAX", "1")
             )
             self._extreme_k_max = max(1, min(self._extreme_k_max, self.n))
+            self._extreme_style = os.environ.get(
+                "PORTFOLIO_MULTIMODAL_EXTREME_STYLE", "rank_bimodal"
+            ).strip().lower()
             print(
                 "[Behavior Policy] multimodal："
                 f"conservative_frac={self._conservative_frac}, "
                 f"conservative_std={self._conservative_std}, "
-                f"extreme_k_max={self._extreme_k_max}"
+                f"extreme_k_max={self._extreme_k_max}, "
+                f"extreme_style={self._extreme_style}"
             )
             self.momentum_scale = float(momentum_scale)
             self.reversion_scale = float(reversion_scale)
@@ -99,13 +106,29 @@ class MixedPortfolioBehaviorPolicy:
         return self.rng.uniform(-1.0, 1.0, size=self.n).astype(np.float32)
 
     def _act_multimodal(self, t: int) -> np.ndarray:
-        """70% 窄 logits（接近等权）；30% 随机 k 标的尖峰重仓（多峰）。"""
+        """低覆盖多峰动作：
+        - conservative：窄 logits（近等权）
+        - extreme：两个相反极端峰（二选一），默认基于前一日收益排序构造
+        """
+        prev_r = self._prev_returns(t)
         if self.rng.random() < self._conservative_frac:
             x = self.rng.normal(0.0, self._conservative_std, size=self.n)
             return np.clip(x, -1.0, 1.0).astype(np.float32)
         k_hi = int(self.rng.integers(1, self._extreme_k_max + 1))
         logits = np.full(self.n, -1.0, dtype=np.float32)
-        idx = self.rng.choice(self.n, size=k_hi, replace=False)
+
+        if self._extreme_style == "rank_bimodal":
+            ranks = np.argsort(prev_r)  # 升序
+            # mode=0: 追涨峰（top-k）；mode=1: 反转峰（bottom-k）
+            mode = int(self.rng.integers(0, 2))
+            if mode == 0:
+                idx = ranks[-k_hi:]
+            else:
+                idx = ranks[:k_hi]
+        else:
+            # 兼容旧逻辑：随机尖峰
+            idx = self.rng.choice(self.n, size=k_hi, replace=False)
+
         logits[idx] = 1.0
         return np.clip(logits, -1.0, 1.0).astype(np.float32)
 
