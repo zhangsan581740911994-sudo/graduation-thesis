@@ -18,3 +18,5 @@ tqdm
 cloudpickle
 wandb
 python-dateutil
+# CSI1000 / akshare 数据脚本：云主机上新浪 HTTP 易断，BaoStock 更稳
+baostock

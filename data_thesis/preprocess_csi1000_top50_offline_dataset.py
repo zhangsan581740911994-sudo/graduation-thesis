@@ -27,14 +27,37 @@ TRAIN_RATIO = 0.7
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 
+# 东财 stock_zh_a_hist 常为中文列名；新浪部分环境为英文。统一成下游使用的英文列。
+_EASTMONEY_TO_EN = {
+    "日期": "date",
+    "开盘": "open",
+    "收盘": "close",
+    "最高": "high",
+    "最低": "low",
+    "成交量": "volume",
+    "成交额": "amount",
+}
+
+
+def normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """将日线行情表规范为列 date,open,high,low,close,volume,amount（字符串日期可保留，下游再 to_datetime）。"""
+    if df is None or df.empty:
+        raise ValueError("empty dataframe")
+    out = df.copy()
+    for zh, en in _EASTMONEY_TO_EN.items():
+        if zh in out.columns and en not in out.columns:
+            out = out.rename(columns={zh: en})
+    required = {"date", "open", "high", "low", "close", "volume", "amount"}
+    missing = required - set(out.columns)
+    if missing:
+        raise ValueError(f"缺少字段: {sorted(missing)}")
+    return out[list(required)].copy()
+
 
 def _read_one_stock_csv(path: Path) -> pd.DataFrame:
     symbol = path.stem.split("_", 1)[0]
     df = pd.read_csv(path)
-    required_cols = {"date", "open", "high", "low", "close", "volume", "amount"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"{path.name} 缺少字段: {sorted(missing)}")
+    df = normalize_ohlcv_columns(df)
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
@@ -48,7 +71,10 @@ def build_aligned_dataset() -> pd.DataFrame:
         raise FileNotFoundError(f"输入目录不存在: {INPUT_DIR}")
     csv_files = sorted(INPUT_DIR.glob("*.csv"))
     if not csv_files:
-        raise FileNotFoundError(f"未找到任何股票 CSV: {INPUT_DIR}")
+        raise FileNotFoundError(
+            f"目录中没有任何 .csv 股票文件: {INPUT_DIR}。"
+            "请先成功运行 python data_thesis/get_csi1000_top50_by_weight.py（云主机建议 pip install baostock）。"
+        )
     frames = [_read_one_stock_csv(f) for f in csv_files]
     df_all = pd.concat(frames, ignore_index=True)
     n_symbols = df_all["symbol"].nunique()

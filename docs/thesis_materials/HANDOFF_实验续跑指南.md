@@ -32,6 +32,15 @@ source venv/bin/activate
 pip install -r requirements-thesis.txt
 ```
 
+### 已有仓库、仅同步最新代码（日常 / 换命令前）
+
+```bash
+cd /root/autodl-tmp/graduation-thesis
+git pull
+source venv/bin/activate
+pip install -r requirements-thesis.txt
+```
+
 ### 第四步：召唤 AI 助手
 环境准备好后，在 Cursor 里新建一个对话框（Chat），把本文档底部的 **“给新助手的启动指令”** 发给 AI。
 
@@ -104,7 +113,9 @@ pip install -r requirements-thesis.txt
 3. 复用 `preprocess_top20_offline_dataset.py` 的逻辑：逐股读入 → 共同交易日对齐 → `return` → 按日期切分 train/val/test，输出例如 `csi1000_top50_offline_train/val/test.csv`（文件名可按你习惯改名）。  
 4. 训练/消融脚本中仅替换 `--portfolio_train_csv` / `--portfolio_eval_csv` 路径，**其余超参不变**，便于对比。
 
-**逐步命令与脚本说明**：见 `docs/thesis_materials/CSI1000_Top50实验步骤.md`（含数据下载、预处理、`run_ablation_multimodal_csi1000.sh`）。
+**逐步命令与脚本说明**：见 `docs/thesis_materials/CSI1000_Top50实验步骤.md`（含 **`git pull`、环境、数据下载、预处理、`run_ablation_multimodal_csi1000.sh`**）。
+
+在 AutoDL 上跑 CSI1000 流程前，务必在项目根目录先 **`git pull`**，再 `source venv/bin/activate` 与 `pip install -r requirements-thesis.txt`（或 `pip install baostock`），避免用的还是旧下载脚本。
 
 ---
 

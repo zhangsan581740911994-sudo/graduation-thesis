@@ -1,0 +1,8 @@
+# 仅用于 CSI1000 数据下载/预处理（akshare + baostock），不改动 JAX/训练栈。
+# AutoDL 上若已装好训练环境，只需执行：
+#   pip install -r requirements-csi1000-data.txt
+# 避免 pip install -r requirements-thesis.txt 反复升降级 jax。
+
+pandas>=1.3
+akshare
+baostock
