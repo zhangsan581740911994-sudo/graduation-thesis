@@ -17,6 +17,24 @@
 import jax
 import jax.numpy as jnp
 
+# lazy：强制在 CPU 设备上 jitted 的 random.split，避免 Ada 等 GPU 上误编 sm_90a PTX
+_split_on_cpu_jit = None
+
+
+def _get_split_on_cpu_jit():
+  global _split_on_cpu_jit
+  if _split_on_cpu_jit is not None:
+    return _split_on_cpu_jit
+  cpu_devs = jax.devices("cpu")
+  if not cpu_devs:
+    return None
+
+  def _do_split(k):
+    return jax.random.split(k)
+
+  _split_on_cpu_jit = jax.jit(_do_split, device=cpu_devs[0])
+  return _split_on_cpu_jit
+
 
 class JaxRNG(object):
 
@@ -39,10 +57,13 @@ class JaxRNG(object):
     if not cpu_devices:
       self.rng, next_rng = jax.random.split(self.rng)
       return jax.device_put(next_rng, gpu_devices[0]) if gpu_devices else next_rng
-    # 先 materialize 到 CPU，再 split；仅 default_device 仍可能在 GPU 上编 threefry。
     k = jax.device_put(self.rng, cpu_devices[0])
-    with jax.default_device(cpu_devices[0]):
-      self.rng, next_rng = jax.random.split(k)
+    jit_split = _get_split_on_cpu_jit()
+    if jit_split is not None:
+      self.rng, next_rng = jit_split(k)
+    else:
+      with jax.default_device(cpu_devices[0]):
+        self.rng, next_rng = jax.random.split(k)
     if gpu_devices:
       return jax.device_put(next_rng, gpu_devices[0])
     return next_rng
